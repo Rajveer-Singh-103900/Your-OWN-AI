@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <cctype>
 #include <array>
+#include <filesystem>
+#include <cstring>
 #include <stdexcept>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -770,9 +772,71 @@ struct DocInfo {                 // one uploaded / pasted document
     std::string title, kind, preview;
     int         chunks;
     size_t      words;
+    std::vector<float> mapEmb;   // 16-D point for the scatter-plot map (may be empty)
 };
 
+// ── Binary document files: data/<user>/<docId>.doc ──────────────────
+// "AURADOC1" | docId u32 | title | kind | words u64 | map (u32 n + n floats)
+// | dims u32 | nChunks u32 | per chunk: text, dims floats
+// Strings are u32 length + UTF-8 bytes. Numbers are little-endian (host order).
+namespace docfile {
+    static const char MAGIC[8] = {'A','U','R','A','D','O','C','1'};
+
+    template <class T> void put(std::ostream& o, T v) { o.write((const char*)&v, sizeof v); }
+    inline void putStr(std::ostream& o, const std::string& s) { put<uint32_t>(o, (uint32_t)s.size()); o.write(s.data(), s.size()); }
+    inline void putFloats(std::ostream& o, const std::vector<float>& v) { o.write((const char*)v.data(), v.size() * sizeof(float)); }
+
+    template <class T> bool get(std::istream& i, T& v) { return (bool)i.read((char*)&v, sizeof v); }
+    inline bool getStr(std::istream& i, std::string& s, uint32_t max = 64u << 20) {
+        uint32_t n; if (!get(i, n) || n > max) return false;
+        s.resize(n); return (bool)i.read(&s[0], n);
+    }
+    inline bool getFloats(std::istream& i, std::vector<float>& v, uint32_t n) {
+        v.resize(n); return (bool)i.read((char*)v.data(), n * sizeof(float));
+    }
+
+    bool write(const std::string& path, const DocInfo& info, const std::vector<std::string>& texts,
+               const std::vector<std::vector<float>>& embs)
+    {
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+            if (!o) return false;
+            o.write(MAGIC, 8);
+            put<uint32_t>(o, (uint32_t)info.docId);
+            putStr(o, info.title); putStr(o, info.kind);
+            put<uint64_t>(o, (uint64_t)info.words);
+            put<uint32_t>(o, (uint32_t)info.mapEmb.size()); putFloats(o, info.mapEmb);
+            put<uint32_t>(o, (uint32_t)(embs.empty() ? 0 : embs[0].size()));
+            put<uint32_t>(o, (uint32_t)texts.size());
+            for (size_t c = 0; c < texts.size(); c++) { putStr(o, texts[c]); putFloats(o, embs[c]); }
+            if (!o.flush()) return false;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);                  // atomic replace
+        return !ec;
+    }
+
+    bool read(const std::string& path, DocInfo& info, std::vector<std::string>& texts,
+              std::vector<std::vector<float>>& embs)
+    {
+        std::ifstream i(path, std::ios::binary);
+        char magic[8];
+        uint32_t id, nMap, dims, n; uint64_t words;
+        if (!i.read(magic, 8) || std::memcmp(magic, MAGIC, 8) != 0) return false;
+        if (!get(i, id) || !getStr(i, info.title, 4096) || !getStr(i, info.kind, 64) || !get(i, words)) return false;
+        if (!get(i, nMap) || nMap > 64 || !getFloats(i, info.mapEmb, nMap)) return false;
+        if (!get(i, dims) || !get(i, n) || dims == 0 || dims > 8192 || n == 0 || n > (uint32_t)MAX_DOC_CHUNKS) return false;
+        info.docId = (int)id; info.words = (size_t)words; info.chunks = (int)n;
+        texts.resize(n); embs.resize(n);
+        for (uint32_t c = 0; c < n; c++)
+            if (!getStr(i, texts[c]) || !getFloats(i, embs[c], dims)) return false;
+        return true;
+    }
+}
+
 class DocumentDB {
+    std::string dir;     // this user's save folder ("" = keep in memory only)
     std::unordered_map<int, DocItem> store;
     std::map<int, DocInfo> docs;
     HNSW       hnsw;
@@ -803,17 +867,73 @@ class DocumentDB {
     }
 
 public:
-    DocumentDB() : hnsw(16, 200) {}
-
     bool hasTitle(const std::string& title) {
         std::lock_guard<std::mutex> lk(mu);
         return hasTitleLocked(title);
     }
 
-    // Stores all chunks of a document at once. Returns docId, or -1 with `err` set.
+private:
+    // Adds a document's chunks to memory and the indexes (caller holds the lock)
+    void addLocked(DocInfo info, const std::vector<std::string>& chunks,
+                   const std::vector<std::vector<float>>& embs)
+    {
+        if (dims == 0) dims = (int)embs[0].size();
+        for (size_t i = 0; i < chunks.size(); i++) {
+            std::string chunkTitle = chunks.size() > 1
+                ? info.title + " [" + std::to_string(i+1) + "/" + std::to_string(chunks.size()) + "]"
+                : info.title;
+            DocItem item{nextId++, info.docId, chunkTitle, chunks[i], embs[i]};
+            VectorItem vi{item.id, chunkTitle, "doc", item.emb};
+            hnsw.insert(vi, cosine); bf.insert(vi);
+            store[item.id] = std::move(item);
+        }
+        std::string preview = utf8Prefix(chunks[0], 160);
+        std::replace(preview.begin(), preview.end(), '\n', ' ');
+        if (preview.size() < chunks[0].size()) preview += "…";
+        info.preview = preview;
+        info.chunks  = (int)chunks.size();
+        docs[info.docId] = std::move(info);
+        nextDocId = std::max(nextDocId, docs.rbegin()->first + 1);
+    }
+
+    std::string pathOf(int docId) { return dir + "/" + std::to_string(docId) + ".doc"; }
+
+public:
+    explicit DocumentDB(std::string saveDir = "") : dir(std::move(saveDir)), hnsw(16, 200) {}
+
+    // Loads this user's saved documents from disk. Returns how many were loaded.
+    int load() {
+        namespace fs = std::filesystem;
+        std::lock_guard<std::mutex> lk(mu);
+        std::error_code ec;
+        if (dir.empty() || !fs::is_directory(dir, ec)) return 0;
+        std::vector<std::pair<int, std::string>> files;
+        for (auto& e : fs::directory_iterator(dir, ec))
+            if (e.path().extension() == ".doc") {
+                try { files.push_back({std::stoi(e.path().stem().string()), e.path().string()}); } catch (...) {}
+            }
+        std::sort(files.begin(), files.end());
+        int loaded = 0;
+        for (auto& [id, path] : files) {
+            DocInfo info; std::vector<std::string> texts; std::vector<std::vector<float>> embs;
+            if (!docfile::read(path, info, texts, embs) || info.docId != id) {
+                std::cerr << "WARNING: skipping unreadable document file " << path << std::endl; continue;
+            }
+            if (dims && (int)embs[0].size() != dims) {
+                std::cerr << "WARNING: skipping " << path << " (embedding size " << embs[0].size()
+                          << " != " << dims << "; was the embed model changed?)" << std::endl; continue;
+            }
+            addLocked(std::move(info), texts, embs);
+            loaded++;
+        }
+        return loaded;
+    }
+
+    // Stores all chunks of a document at once (memory + disk). Returns docId, or -1 with `err` set.
     int insertDocument(const std::string& title, const std::string& kind,
                        const std::vector<std::string>& chunks,
-                       const std::vector<std::vector<float>>& embs, size_t words, std::string& err)
+                       const std::vector<std::vector<float>>& embs, size_t words,
+                       const std::vector<float>& mapEmb, std::string& err)
     {
         std::lock_guard<std::mutex> lk(mu);
         if (hasTitleLocked(title)) { err = "A document named \"" + title + "\" is already stored. Delete it first."; return -1; }
@@ -824,23 +944,20 @@ public:
                       "). Did the embed model change? Restart the server.";
                 return -1;
             }
-        dims = d;
 
-        int docId = nextDocId++;
-        for (size_t i = 0; i < chunks.size(); i++) {
-            std::string chunkTitle = chunks.size() > 1
-                ? title + " [" + std::to_string(i+1) + "/" + std::to_string(chunks.size()) + "]"
-                : title;
-            DocItem item{nextId++, docId, chunkTitle, chunks[i], embs[i]};
-            VectorItem vi{item.id, chunkTitle, "doc", item.emb};
-            hnsw.insert(vi, cosine); bf.insert(vi);
-            store[item.id] = std::move(item);
+        DocInfo info{nextDocId, title, kind, "", (int)chunks.size(), words, mapEmb};
+        if (!dir.empty()) {                                      // save first: never keep an unsaved document
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+#ifndef _WIN32
+            ::chmod(dir.c_str(), 0700);
+#endif
+            if (!docfile::write(pathOf(info.docId), info, chunks, embs)) {
+                err = "Could not save the document to " + dir; return -1;
+            }
         }
-        std::string preview = utf8Prefix(chunks[0], 160);
-        std::replace(preview.begin(), preview.end(), '\n', ' ');
-        if (preview.size() < chunks[0].size()) preview += "…";
-        docs[docId] = {docId, title, kind, preview, (int)chunks.size(), words};
-        return docId;
+        addLocked(info, chunks, embs);
+        return info.docId;
     }
 
     // Semantic search — returns top-k most similar chunks
@@ -865,6 +982,7 @@ public:
         for (auto it = store.begin(); it != store.end(); )
             it = (it->second.docId == docId) ? store.erase(it) : std::next(it);
         docs.erase(docId);
+        if (!dir.empty()) { std::error_code ec; std::filesystem::remove(pathOf(docId), ec); }
         rebuildIndexes();
         if (store.empty()) dims = 0;
         return true;
@@ -1184,11 +1302,37 @@ public:
     }
 };
 
-// Each user gets their own demo vectors and documents
+// Each user gets their own demo vectors and documents.
+// Documents are saved under data/<username>/ and reloaded on first use after a restart.
 struct UserSpace {
     VectorDB   db{DIMS};
     DocumentDB docs;
-    UserSpace() { loadDemo(db); }
+    std::mutex mapMu;
+    std::unordered_map<int, int> mapPoint;   // docId → id of the document's dot on the demo map
+
+    explicit UserSpace(const std::string& user) : docs("data/" + user) {
+        loadDemo(db);
+        int n = docs.load();
+        for (auto& d : docs.list()) addMapPoint(d.docId, d.title, d.mapEmb);
+        if (n) std::cout << "Loaded " << n << " saved document(s) for " << user << std::endl;
+    }
+
+    void addMapPoint(int docId, const std::string& title, const std::vector<float>& emb) {
+        if ((int)emb.size() != DIMS) return;
+        int id = db.insert(title, "doc", emb, getDistFn("cosine"));
+        std::lock_guard<std::mutex> lk(mapMu);
+        mapPoint[docId] = id;
+    }
+
+    void removeMapPoint(int docId) {
+        int id = -1;
+        {
+            std::lock_guard<std::mutex> lk(mapMu);
+            auto it = mapPoint.find(docId);
+            if (it != mapPoint.end()) { id = it->second; mapPoint.erase(it); }
+        }
+        if (id >= 0) db.remove(id);
+    }
 };
 
 // =====================================================================
@@ -1218,7 +1362,7 @@ int main(int argc, char** argv) {
         if (name.empty()) throw std::runtime_error("not signed in");
         std::lock_guard<std::mutex> lk(spacesMu);
         auto& sp = spaces[name];
-        if (!sp) sp = std::make_unique<UserSpace>();
+        if (!sp) sp = std::make_unique<UserSpace>(name);
         return *sp;
     };
 
@@ -1409,7 +1553,8 @@ int main(int argc, char** argv) {
 
     // ── DOCUMENT + RAG ENDPOINTS ──────────────────────────────────────
 
-    // POST /doc/insert  {"title":"...","text":"...","kind":"PDF"}
+    // POST /doc/insert  {"title":"...","text":"...","kind":"PDF","map":[16 floats]}
+    // "map" is the document's position on the demo scatter plot (optional).
     // The browser extracts text from uploaded files (PDF, Word, Excel, …) and sends it here.
     // Chunks the text, embeds all chunks via Ollama, then stores the document atomically.
     svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
@@ -1432,9 +1577,17 @@ int main(int argc, char** argv) {
         auto embs = ollama.embedBatch(chunks, err);
         if (embs.empty()) return jsonErr(res, 503, err);
 
+        std::vector<float> mapEmb;
+        size_t mp = jFindKey(req.body, "map");
+        if (mp != std::string::npos && req.body[mp] == '[') {
+            size_t e = req.body.find(']', mp);
+            if (e != std::string::npos) mapEmb = parseVec(req.body.substr(mp + 1, e - mp - 1));
+        }
+
         size_t words = countWords(text);
-        int docId = sp.docs.insertDocument(title, kind, chunks, embs, words, err);
-        if (docId < 0) return jsonErr(res, 409, err);
+        int docId = sp.docs.insertDocument(title, kind, chunks, embs, words, mapEmb, err);
+        if (docId < 0) return jsonErr(res, err.rfind("Could not save", 0) == 0 ? 500 : 409, err);
+        sp.addMapPoint(docId, title, mapEmb);
 
         std::ostringstream ss;
         ss << "{\"docId\":"  << docId
@@ -1449,6 +1602,7 @@ int main(int argc, char** argv) {
         auto& sp = space(req);
         int id  = std::stoi(req.matches[1]);
         bool ok = sp.docs.removeDocument(id);
+        if (ok) sp.removeMapPoint(id);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });

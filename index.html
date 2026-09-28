@@ -727,19 +727,15 @@ async function checkOllamaStatus() {
 
 // Sends extracted text to the server (chunk → embed → store). Throws on error.
 async function ingestText(title, text, kind) {
+  // 16D keyword vector so the document also shows up on the scatter-plot map (saved with it)
+  const map = textToEmbedding(title + ' ' + text.split(/\s+/).slice(0, 3000).join(' '));
   const r = await fetch(API+'/doc/insert', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({title, text, kind})
+    body:JSON.stringify({title, text, kind, map})
   });
   const d = await r.json();
   if (d.error) throw new Error(d.error);
-
-  // Insert a 16D keyword vector into the visualizer DB so the document shows up on the map
-  const emb16 = textToEmbedding(title + ' ' + text.split(/\s+/).slice(0, 3000).join(' '));
-  fetch(API+'/insert', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({metadata: title, category: 'doc', embedding: emb16})
-  }).then(() => loadItems().then(loadHNSW));
+  loadItems().then(loadHNSW);
   return d;
 }
 
@@ -826,12 +822,9 @@ async function processUploads() {
   window.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files.length) { switchTab('docs'); addFiles([...e.dataTransfer.files]); } });
 })();
 
-let docCache = [];
-
 async function loadDocList() {
   try {
     const r=await fetch(API+'/doc/list'), docs=await r.json();
-    docCache = docs;
     document.getElementById('docCountLabel').textContent=docs.length;
     if (!docs.length) {
       document.getElementById('docList').innerHTML='<div style="color:var(--muted);font-size:11px">No documents yet.</div>';
@@ -851,12 +844,8 @@ async function loadDocList() {
 
 async function deleteDoc(docId) {
   try {
-    const title = (docCache.find(d => d.docId === docId) || {}).title;
-    await fetch(`${API}/doc/delete/${docId}`,{method:'DELETE'});
-    // Also remove the document's point from the scatter-plot map
-    const pts = allItems.filter(v => v.category === 'doc' && v.metadata === title);
-    await Promise.all(pts.map(v => fetch(`${API}/delete/${v.id}`, {method:'DELETE'})));
-    if (pts.length) loadItems().then(loadHNSW);
+    await fetch(`${API}/doc/delete/${docId}`,{method:'DELETE'});   // server also removes its map point
+    loadItems().then(loadHNSW);
     loadDocList(); checkOllamaStatus();
   } catch(_) {}
 }

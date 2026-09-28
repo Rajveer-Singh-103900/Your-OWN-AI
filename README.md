@@ -192,6 +192,7 @@ You'll see the **Aura AI sign-in page**. The first time, click **CREATE ACCOUNT*
 (3–32 letters/digits/`_.-`) and a password (8+ characters). You're signed in straight away.
 
 - Accounts are saved in `users.txt` in the project folder (password **hashes** only, never the passwords). Delete that file to remove all accounts.
+- Each user's documents are saved in `data/<username>/`. Delete that folder to wipe a user's documents.
 - Each account has its own documents and demo map. Other users can't see or search them.
 - 5 wrong passwords lock that username for 15 minutes.
 - By default the server only accepts connections **from this computer**. To let other devices on your Wi-Fi reach it (for example a phone), start it with `./db --lan`.
@@ -219,6 +220,8 @@ This uses Ollama to generate **real 768-dimensional embeddings** from your docum
 3. Or open **✎ OR PASTE TEXT** to paste notes directly.
 4. Long documents are automatically split into overlapping 250-word chunks, each with its own embedding.
 5. The ✕ on a stored document deletes the whole document (all of its chunks).
+6. Documents are **saved to disk** in `data/<username>/` (one file per document, including its embeddings),
+   so they're still there after you restart the server — nothing needs to be re-embedded.
 
 **Supported formats**
 
@@ -285,7 +288,7 @@ Every other endpoint requires a signed-in session (cookie `aura_session`); witho
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `POST` | `/doc/insert` | `{"title":"...","text":"...","kind":"PDF"}` | Chunk, embed and store a document (all-or-nothing) |
+| `POST` | `/doc/insert` | `{"title":"...","text":"...","kind":"PDF","map":[16 floats]}` | Chunk, embed, save and store a document (all-or-nothing); `map` = optional scatter-plot position |
 | `GET` | `/doc/list` | — | List stored documents (one entry per document) |
 | `DELETE` | `/doc/delete/:docId` | — | Delete a whole document |
 | `POST` | `/doc/search` | `{"question":"...","k":3}` | Retrieval only (no LLM) |
@@ -318,6 +321,8 @@ Your-OWN-AI/
 ├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
 ├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark, uploads)
 ├── login.html      ← Sign-in / create-account page
+├── users.txt       ← Accounts (created on first sign-up, not in git)
+├── data/           ← Saved documents per user (created on first upload, not in git)
 ├── extract.js      ← Browser-side text extraction for uploaded documents
 ├── vendor/         ← Document parsers: pdf.js, mammoth, SheetJS, JSZip
 └── README.md       ← This file
@@ -368,7 +373,7 @@ KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almo
 | `Ollama: OFFLINE` in header | Run `ollama serve` in a terminal |
 | Embedding takes forever | Ollama is downloading the model on first use, wait 2 min |
 | `g++: command not found` | Add `C:\msys64\ucrt64\bin` to Windows PATH |
-| Forgot password | Delete that user's line from `users.txt` and create the account again (their documents are lost on restart anyway) |
+| Forgot password | Delete that user's line from `users.txt` and create the account again with the same username — their saved documents in `data/<username>/` come back |
 | Port 8080 already in use | Kill the process: `netstat -ano \| findstr 8080` then `taskkill /PID <pid> /F` |
 | LLM answer is slow | Normal — llama3.2 takes 10–30s on a laptop CPU. Use llama3.2:1b for faster answers |
 
