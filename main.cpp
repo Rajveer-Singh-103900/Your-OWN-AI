@@ -22,6 +22,7 @@
 #include <array>
 #include <filesystem>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -1229,27 +1230,43 @@ public:
         return "";
     }
 
-    // Returns "" on success or an error message (same message for unknown user / wrong password)
-    std::string check(const std::string& name, const std::string& pw) {
-        User u; bool known;
+    struct LoginResult {
+        std::string err;         // "" on success; same message for unknown user / wrong password
+        bool known   = false;    // username exists (for the server's log only, never sent to the client)
+        bool blocked = false;    // rejected because the username is locked
+        bool locked  = false;    // this failure triggered the lock
+        int  fails   = 0;        // failures in the current window
+    };
+    static int maxFails() { return MAX_FAILS; }
+
+    LoginResult check(const std::string& name, const std::string& pw) {
+        LoginResult r;
+        User u;
         {
             std::lock_guard<std::mutex> lk(mu);
             auto& t = throttle[name];
             auto now = std::chrono::steady_clock::now();
-            if (t.fails >= MAX_FAILS && now < t.lockedUntil)
-                return "Too many failed attempts. Try again in " + std::to_string(LOCK_MINUTES) + " minutes.";
-            known = users.count(name) > 0;
-            u = known ? users[name] : User{ITERATIONS, Bytes(16, 0), Bytes(32, 0)};
+            r.known = users.count(name) > 0;
+            if (t.fails >= MAX_FAILS && now < t.lockedUntil) {
+                r.blocked = true; r.fails = t.fails;
+                r.err = "Too many failed attempts. Try again in " + std::to_string(LOCK_MINUTES) + " minutes.";
+                return r;
+            }
+            u = r.known ? users[name] : User{ITERATIONS, Bytes(16, 0), Bytes(32, 0)};
         }
         // Hash even for unknown users so response time doesn't reveal which usernames exist
-        bool ok = constTimeEq(pbkdf2(pw, u.salt, u.iterations), u.hash) && known;
+        bool ok = constTimeEq(pbkdf2(pw, u.salt, u.iterations), u.hash) && r.known;
         std::lock_guard<std::mutex> lk(mu);
         auto& t = throttle[name];
-        if (ok) { t = Throttle(); return ""; }
+        if (ok) { t = Throttle(); return r; }
         if (t.fails >= MAX_FAILS) t.fails = 0;                 // previous lock expired: new window
-        if (++t.fails >= MAX_FAILS)
+        r.fails = ++t.fails;
+        if (t.fails >= MAX_FAILS) {
             t.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(LOCK_MINUTES);
-        return "Invalid username or password";
+            r.locked = true;
+        }
+        r.err = "Invalid username or password";
+        return r;
     }
 };
 
@@ -1299,6 +1316,48 @@ public:
     void destroy(const httplib::Request& req) {
         std::lock_guard<std::mutex> lk(mu);
         sessions.erase(tokenOf(req));
+    }
+};
+
+// Sign-in activity log: printed to the terminal and appended to auth.log
+//   2026-09-29 14:02:11  LOGIN OK       recruiter     127.0.0.1
+class AuthLog {
+    std::ofstream file;
+    std::mutex mu;
+
+    // Usernames in failed logins are whatever the client sent: keep one safe, short token per field
+    static std::string clean(const std::string& s) {
+        std::string o;
+        for (unsigned char c : s) {
+            if (o.size() >= 40) { o += "…"; break; }
+            o += (c > 0x20 && c < 0x7F) ? (char)c : '?';
+        }
+        return o.empty() ? "-" : o;
+    }
+
+public:
+    explicit AuthLog(const std::string& path) : file(path, std::ios::app) {
+#ifndef _WIN32
+        ::chmod(path.c_str(), 0600);
+#endif
+    }
+
+    void write(const std::string& event, const std::string& user, const std::string& ip,
+               const std::string& detail = "")
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        std::time_t t = std::time(nullptr);
+        char when[32];
+        std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        std::ostringstream line;
+        line << when << "  " << std::left << std::setw(14) << event << ' '
+             << std::setw(16) << clean(user) << ' ' << std::setw(15) << ip
+             << (detail.empty() ? "" : "  " + detail);
+        std::string out = line.str();
+        out.erase(out.find_last_not_of(' ') + 1);
+        std::cout << out << std::endl;
+        file << out << '\n';
+        file.flush();
     }
 };
 
@@ -1353,6 +1412,7 @@ int main(int argc, char** argv) {
     OllamaClient ollama;
     UserStore    users("users.txt");
     SessionStore sessions;
+    AuthLog      authLog("auth.log");
 
     std::map<std::string, std::unique_ptr<UserSpace>> spaces;
     std::mutex spacesMu;
@@ -1414,21 +1474,37 @@ int main(int argc, char** argv) {
     svr.Post("/auth/register", [&](const httplib::Request& req, httplib::Response& res) {
         auto name = extractStr(req.body, "username"), pw = extractStr(req.body, "password");
         auto err = users.create(name, pw);
-        if (!err.empty()) return jsonErr(res, err.find("taken") != std::string::npos ? 409 : 400, err);
-        std::cout << "New user registered: " << name << std::endl;
+        if (!err.empty()) {
+            authLog.write("SIGNUP FAILED", name, req.remote_addr, err);
+            return jsonErr(res, err.find("taken") != std::string::npos ? 409 : 400, err);
+        }
+        authLog.write("SIGNUP", name, req.remote_addr, "new account, signed in");
         signIn(res, name);
     });
 
     // POST /auth/login {"username":"...","password":"..."}
     svr.Post("/auth/login", [&](const httplib::Request& req, httplib::Response& res) {
         auto name = extractStr(req.body, "username"), pw = extractStr(req.body, "password");
-        auto err = users.check(name, pw);
-        if (!err.empty()) return jsonErr(res, err.find("Too many") != std::string::npos ? 429 : 401, err);
+        auto r = users.check(name, pw);
+        if (r.blocked) {
+            authLog.write("LOGIN BLOCKED", name, req.remote_addr, "account is locked");
+            return jsonErr(res, 429, r.err);
+        }
+        if (!r.err.empty()) {
+            std::string detail = (r.known ? "wrong password" : "no such user") +
+                std::string(" (") + std::to_string(r.fails) + "/" + std::to_string(UserStore::maxFails()) + ")";
+            authLog.write("LOGIN FAILED", name, req.remote_addr, detail);
+            if (r.locked) authLog.write("LOCKED", name, req.remote_addr, "too many failures, locked for 15 min");
+            return jsonErr(res, 401, r.err);
+        }
+        authLog.write("LOGIN OK", name, req.remote_addr);
         signIn(res, name);
     });
 
     // POST /auth/logout
     svr.Post("/auth/logout", [&](const httplib::Request& req, httplib::Response& res) {
+        auto name = sessions.user(req);
+        if (!name.empty()) authLog.write("LOGOUT", name, req.remote_addr);
         sessions.destroy(req);
         setSessionCookie(res, "", 0);
         res.set_content("{\"ok\":true}", "application/json");

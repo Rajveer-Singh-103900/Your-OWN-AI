@@ -26,3 +26,9 @@ users.txt.tmp
 
 # Saved documents (per user)
 data/
+
+# Sign-in activity log (usernames, IPs) — private
+auth.log
+
+# Local notes for Claude Code (not part of the project)
+CLAUDE.md
