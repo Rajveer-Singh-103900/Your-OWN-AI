@@ -1,398 +1,553 @@
-# VectorDB — Build a Vector Database from Scratch in C++
+# Aura AI
 
-A fully working **Vector Database** built from scratch in C++ with a web UI.  
-Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-side, plus a **RAG pipeline** powered by a local LLM via Ollama.
+**Your own private AI assistant. It answers questions from your documents and runs entirely on your computer.**
 
-> Built as an educational project to show how production vector databases like Pinecone, Weaviate, and Chroma actually work under the hood.
+Aura AI is a **vector database written from scratch in C++** with a web interface and a **RAG (Retrieval-Augmented Generation)** pipeline. Upload PDFs, Word files, PowerPoints, spreadsheets and more, then ask questions about them. A local AI model (via [Ollama](https://ollama.com)) finds the relevant passages and answers. No cloud service is involved and no document ever leaves your machine.
 
----
+It is also a hands-on way to see how production vector databases such as Pinecone, Weaviate or Chroma work under the hood. Three nearest-neighbour search algorithms (**HNSW**, **KD-Tree**, **Brute Force**) run side by side on a live, visual map of "semantic space".
 
-## What This Project Does
-
-| Feature | Description |
-|---|---|
-| **3 Search Algorithms** | HNSW (production-grade), KD-Tree, Brute Force — run all three and compare speed |
-| **3 Distance Metrics** | Cosine similarity, Euclidean distance, Manhattan distance |
-| **16D Demo Vectors** | 20 pre-loaded semantic vectors across 4 categories (CS, Math, Food, Sports) |
-| **2D PCA Scatter Plot** | Live visualization of semantic space — watch clusters form |
-| **Upload Any Document** | PDF, Word, PowerPoint, Excel, CSV, OpenDocument, RTF, EPUB, HTML, TXT/Markdown, code — text is extracted in the browser and embedded with `nomic-embed-text` (768D) |
-| **RAG Pipeline** | Ask questions about your documents → HNSW retrieves context → local LLM answers |
-| **User Accounts** | Sign in / create account; each user has private documents. Salted PBKDF2 password hashes, session cookies, lockout after 5 failed logins |
-| **Full REST API** | CRUD endpoints: insert, delete, search, benchmark, hnsw-info |
+![Aura AI answering a question from uploaded documents](docs/screenshots/ask-ai.png)
 
 ---
 
-## How It Works
+## Table of contents
 
+1. [Features](#features)
+2. [How it works](#how-it-works)
+3. [Quick start (macOS)](#quick-start-macos)
+4. [Installation in detail](#installation-in-detail)
+5. [Running Aura AI](#running-aura-ai)
+6. [Using the app](#using-the-app)
+7. [Accounts & security](#accounts--security)
+8. [Where your data is stored](#where-your-data-is-stored)
+9. [Configuration](#configuration)
+10. [REST API](#rest-api)
+11. [Project structure](#project-structure)
+12. [Architecture](#architecture)
+13. [Algorithms explained](#algorithms-explained)
+14. [Troubleshooting](#troubleshooting)
+15. [Limitations & roadmap](#limitations--roadmap)
+16. [Credits & license](#credits--license)
+
+---
+
+## Features
+
+| | Feature | What it means |
+|---|---|---|
+| 📄 | **Upload almost any document** | PDF, Word (`.docx`, `.doc`), PowerPoint (`.pptx`, `.ppt`), Excel (`.xlsx`, `.xls`), CSV, OpenDocument, RTF, EPUB, HTML, Markdown, plain text and source code. Drag and drop many files at once. |
+| 🤖 | **Ask questions about your documents** | A local LLM (`llama3.2`) answers using the most relevant passages and shows exactly which ones it used. |
+| 🔒 | **Private & offline** | Text is extracted in your browser, embedded and answered by models running on your machine. Works without internet once installed. |
+| 👤 | **User accounts** | Sign in / create account. Each user has their own private documents. Passwords are stored as salted PBKDF2 hashes, and 5 failed logins lock an account for 15 minutes. |
+| 📝 | **Sign-in activity log** | Every sign-up, login, failed attempt, lockout and sign-out is recorded with time and IP address. |
+| 💾 | **Documents are saved** | Uploaded documents and their embeddings are stored on disk and come back after a restart, without re-processing. |
+| 🔍 | **3 search algorithms** | HNSW (what production vector DBs use), KD-Tree and Brute Force. Run them side by side and compare their speed. |
+| 📐 | **3 distance metrics** | Cosine, Euclidean and Manhattan. |
+| 🗺️ | **Live semantic map** | A 2-D PCA scatter plot of the vector space. Watch similar items cluster together, and see your query land among its nearest neighbours. |
+| 🔌 | **REST API** | Everything the UI does is available over HTTP. |
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["📄 Your file<br/>PDF · Word · Excel · …"] -->|"read in the browser<br/>(extract.js)"| B["Plain text"]
+    B -->|"split into ~250-word<br/>overlapping chunks"| C["Chunks"]
+    C -->|"Ollama<br/>nomic-embed-text"| D["768-number vectors<br/>(embeddings)"]
+    D --> E[("Vector database<br/>C++ · saved to disk")]
+    Q["❓ Your question"] -->|"embedded the same way"| E
+    E -->|"3 most similar chunks"| L["Ollama<br/>llama3.2"]
+    L --> R["💬 Answer + sources"]
 ```
-Your Text
-    │
-    ▼
-Ollama (nomic-embed-text)          ← converts text to a 768-dimensional vector
-    │
-    ▼
-HNSW Index (C++)                   ← indexes the vector in a multilayer graph
-    │
-    ▼
-Semantic Search                    ← finds nearest neighbors in vector space
-    │
-    ▼
-Ollama (llama3.2)                  ← reads retrieved chunks, generates an answer
-    │
-    ▼
-Answer
-```
 
-**HNSW (Hierarchical Navigable Small World)** is the same algorithm used by Pinecone, Weaviate, Chroma, and Milvus. It builds a multilayer graph where each layer is progressively sparser — searches start at the top layer and zoom in, achieving O(log N) complexity instead of O(N) for brute force.
+1. **Extract.** When you upload a file, your browser reads its text (PDF pages, Word paragraphs, slides, spreadsheet rows…).
+2. **Chunk.** The server splits long text into overlapping pieces of about 250 words, so each piece is about one topic.
+3. **Embed.** Each chunk is turned into an **embedding**: a list of 768 numbers that captures its *meaning*. Texts about similar things get similar numbers.
+4. **Store.** The embeddings go into the vector database (and onto disk).
+5. **Retrieve.** When you ask a question, the question is embedded too, and the database finds the chunks whose embeddings are **closest** to it (*nearest-neighbour search*).
+6. **Generate.** Those chunks are given to the language model as context, and it writes the answer. The app shows which chunks were used.
+
+This is **RAG (Retrieval-Augmented Generation)**. The AI answers from *your* documents instead of only from what it memorised during training.
 
 ---
 
-## Prerequisites
+## Quick start (macOS)
 
-You need **3 things** installed on your Windows laptop:
-
-1. **MSYS2** (gives you g++ compiler)
-2. **Git**
-3. **Ollama** (runs the local AI models)
-
----
-
-## Step-by-Step Setup (Windows)
-
-### Step 1 — Install MSYS2 (C++ Compiler)
-
-1. Go to **https://www.msys2.org** and download the installer
-2. Run the installer, keep default path (`C:\msys64`)
-3. After install, open **MSYS2 UCRT64** from Start Menu (the orange icon)
-4. Run these commands inside the MSYS2 terminal:
+Already have Xcode Command Line Tools and Ollama? Then this is all:
 
 ```bash
-pacman -Syu
-```
-*(Close and reopen the terminal if it asks you to)*
-
-```bash
-pacman -S mingw-w64-ucrt-x86_64-gcc
-```
-
-5. Add g++ to your Windows PATH:
-   - Press `Win + R`, type `sysdm.cpl`, press Enter
-   - Click **Advanced** → **Environment Variables**
-   - Under **System variables**, find **Path**, click **Edit**
-   - Click **New** and add: `C:\msys64\ucrt64\bin`
-   - Click OK on all windows
-   - **Open a new PowerShell** and verify:
-   ```
-   g++ --version
-   ```
-   You should see something like `g++ (GCC) 15.x.x`
-
----
-
-### Step 2 — Install Git
-
-1. Go to **https://git-scm.com/download/win** and download Git for Windows
-2. Run the installer with default settings
-3. Verify in PowerShell:
-```
-git --version
-```
-
----
-
-### Step 3 — Install Ollama (Local AI Models)
-
-1. Go to **https://ollama.com** and click **Download for Windows**
-2. Run the installer
-3. Ollama starts automatically in the system tray
-4. Open **PowerShell** and pull the two required models:
-
-```powershell
+# 1. Get the AI models (one time, ~2.3 GB)
 ollama pull nomic-embed-text
-```
-*(~274 MB — this is the embedding model)*
-
-```powershell
 ollama pull llama3.2
-```
-*(~2 GB — this is the language model)*
 
-5. Verify Ollama is running:
-```powershell
-ollama list
-```
-You should see both models listed.
+# 2. Get the code and build the server (~10 s)
+git clone https://github.com/Rajveer-Singh-103900/Your-OWN-AI.git
+cd Your-OWN-AI
+clang++ -std=c++17 -O2 main.cpp -o db
 
-> **Minimum specs for Ollama:** 8GB RAM recommended. The models will use ~3GB total.
-
----
-
-### Step 4 — Clone the Repository
-
-Open **PowerShell** and run:
-
-```powershell
-git clone https://github.com/YOUR_USERNAME/VectorDB.git
-cd VectorDB
-```
-
-*(Replace `YOUR_USERNAME` with the actual GitHub username)*
-
----
-
-### Step 5 — Compile the C++ Server
-
-Inside the `VectorDB` folder, run:
-
-```powershell
-g++ -std=c++17 -O2 main.cpp -o db -lws2_32
-```
-
-This produces `db.exe`. It takes about 10–20 seconds.
-
-> **macOS / Linux:** `clang++ -std=c++17 -O2 main.cpp -o db` (Linux: `g++ -std=c++17 -O2 main.cpp -o db -pthread`).
-> Always start the server **from the project folder** — it serves `index.html`, `extract.js` and `vendor/` from there.
-> To use another port: `./db 8090`. To allow other devices on your network: `./db --lan`.
-
-> **Troubleshooting:**
-> - `g++: command not found` → MSYS2 not in PATH, redo Step 1 point 5
-> - `undefined reference to WSA...` → missing `-lws2_32` flag, add it
-> - Takes too long? Remove `-O2` for faster (but slower executable) compile
-
----
-
-### Step 6 — Run Everything
-
-**Terminal 1** — Start Ollama (if not already running):
-```powershell
-ollama serve
-```
-*(If Ollama is already in the system tray, skip this)*
-
-**Terminal 2** — Start the VectorDB server:
-```powershell
+# 3. Run it
 ./db
 ```
 
-You should see:
-```
-=== VectorDB Engine ===
-http://localhost:8080
-20 demo vectors | 16 dims | HNSW+KD-Tree+BruteForce
-Ollama: ONLINE
-  embed model: nomic-embed-text  gen model: llama3.2
-```
-
-**Open your browser** and go to:
-```
-http://localhost:8080
-```
-
-You'll see the **Aura AI sign-in page**. The first time, click **CREATE ACCOUNT**, pick a username
-(3–32 letters/digits/`_.-`) and a password (8+ characters). You're signed in straight away.
-
-- Accounts are saved in `users.txt` in the project folder (password **hashes** only, never the passwords). Delete that file to remove all accounts.
-- Each user's documents are saved in `data/<username>/`. Delete that folder to wipe a user's documents.
-- Each account has its own documents and demo map. Other users can't see or search them.
-- 5 wrong passwords lock that username for 15 minutes.
-- By default the server only accepts connections **from this computer**. To let other devices on your Wi-Fi reach it (for example a phone), start it with `./db --lan`.
+Open **http://localhost:8080**, click **CREATE ACCOUNT**, and start uploading documents.
 
 ---
 
-## Using the Application
+## Installation in detail
 
-### Tab 1: Search (Demo Vectors)
+### What you need
 
-- Type any concept in the search box: `binary tree`, `sushi`, `basketball`, `calculus`
-- Choose your algorithm: **HNSW**, **KD-Tree**, or **Brute Force**
-- Choose distance metric: **Cosine**, **Euclidean**, or **Manhattan**
-- Click **⚡ SEARCH** — results appear with distances, the matching point glows on the scatter plot
-- Click **▶ COMPARE ALL ALGOS** to run all 3 algorithms and compare their speed
-
-**The scatter plot** shows all 20 vectors projected to 2D using PCA. Notice how the 4 semantic categories (CS, Math, Food, Sports) form distinct clusters — this is what "semantic similarity" looks like visually.
-
-### Tab 2: Documents (Real Embeddings)
-
-This uses Ollama to generate **real 768-dimensional embeddings** from your documents.
-
-1. **Drag & drop files** onto the upload box (or click it to browse). You can add many at once.
-2. Each file is read **in your browser** — nothing leaves your machine — then chunked and embedded.
-3. Or open **✎ OR PASTE TEXT** to paste notes directly.
-4. Long documents are automatically split into overlapping 250-word chunks, each with its own embedding.
-5. The ✕ on a stored document deletes the whole document (all of its chunks).
-6. Documents are **saved to disk** in `data/<username>/` (one file per document, including its embeddings),
-   so they're still there after you restart the server — nothing needs to be re-embedded.
-
-**Supported formats**
-
-| Type | Extensions |
-|---|---|
-| PDF | `.pdf` (with selectable text) |
-| Word | `.docx`, `.doc` (97–2003) |
-| PowerPoint | `.pptx`, `.ppt` (97–2003) — slide text and speaker notes |
-| Spreadsheets | `.xlsx`, `.xls`, `.xlsb`, `.ods`, `.csv`, `.tsv` — each row indexed as `Column: value` |
-| OpenDocument | `.odt`, `.odp`, `.ods` |
-| Other documents | `.rtf`, `.epub`, `.html`, `.xml` |
-| Plain text | `.txt`, `.md`, `.json`, `.log`, source code, … (any text file) |
-
-Not supported yet: scanned PDFs and images (need OCR), password-protected files, Apple Pages/Keynote
-(export to PDF/Word first), audio/video, and archives (`.zip` — unzip first). These are rejected with a clear message.
-File type is detected from the content, so a mis-named file (e.g. a `.docx` saved as `.doc`) still works.
-
-### Tab 3: Ask AI (RAG Pipeline)
-
-1. Make sure you have inserted some documents in Tab 2 first
-2. Type a question about your documents
-3. Click **🤖 ASK AI**
-
-What happens behind the scenes:
-```
-1. Your question → embedded with nomic-embed-text (768D vector)
-2. HNSW search → finds 3 most semantically similar chunks
-3. Retrieved chunks → sent as context to llama3.2
-4. llama3.2 → generates an answer based only on your documents
-```
-
-The answer streams in with a typewriter effect. Click the **context chips** to see exactly which chunks the AI used.
-
----
-
-## REST API Reference
-
-The server exposes a full REST API at `http://localhost:8080`.
-
-### Demo Vector Endpoints
-
-| Method | Endpoint | Description |
+| Requirement | Why | Size |
 |---|---|---|
-| `GET` | `/search?v=f1,f2,...&k=5&metric=cosine&algo=hnsw` | K-NN search |
-| `POST` | `/insert` | Insert a demo vector |
-| `DELETE` | `/delete/:id` | Delete by ID |
-| `GET` | `/items` | List all demo vectors |
-| `GET` | `/benchmark?v=...&k=5&metric=cosine` | Compare all 3 algorithms |
-| `GET` | `/hnsw-info` | HNSW graph structure and layer stats |
-| `GET` | `/stats` | Database statistics |
+| A C++17 compiler | Builds the server (`clang++` on macOS, `g++` on Windows/Linux) | — |
+| [Ollama](https://ollama.com) | Runs the AI models locally | ~500 MB |
+| `nomic-embed-text` model | Turns text into embeddings | ~274 MB |
+| `llama3.2` model | Writes the answers | ~2 GB |
+| A modern browser | Chrome, Edge, Firefox or Safari | — |
+| ~8 GB RAM recommended | The models use about 3 GB while running | — |
 
-### Auth Endpoints
+Everything else (the HTTP server library and the document-reading libraries) is already included in the repository.
 
-Every other endpoint requires a signed-in session (cookie `aura_session`); without one they return `401`.
+### macOS
 
-| Method | Endpoint | Body | Description |
-|---|---|---|---|
-| `POST` | `/auth/register` | `{"username":"...","password":"..."}` | Create account and sign in |
-| `POST` | `/auth/login` | `{"username":"...","password":"..."}` | Sign in (sets session cookie) |
-| `POST` | `/auth/logout` | — | Sign out |
-| `GET` | `/auth/me` | — | Current username |
+1. **Install the compiler.** Open Terminal and run:
+   ```bash
+   xcode-select --install
+   ```
+   Check it: `clang++ --version`
+2. **Install Ollama** from **https://ollama.com/download** and open it once. It then runs in the menu bar.
+3. **Download the models:**
+   ```bash
+   ollama pull nomic-embed-text
+   ollama pull llama3.2
+   ollama list          # both should be listed
+   ```
+4. **Get the code and build:**
+   ```bash
+   git clone https://github.com/Rajveer-Singh-103900/Your-OWN-AI.git
+   cd Your-OWN-AI
+   clang++ -std=c++17 -O2 main.cpp -o db
+   ```
+   This creates the server program `db` in about 10 seconds.
 
-### Document & RAG Endpoints
+### Windows
 
-| Method | Endpoint | Body | Description |
-|---|---|---|---|
-| `POST` | `/doc/insert` | `{"title":"...","text":"...","kind":"PDF","map":[16 floats]}` | Chunk, embed, save and store a document (all-or-nothing); `map` = optional scatter-plot position |
-| `GET` | `/doc/list` | — | List stored documents (one entry per document) |
-| `DELETE` | `/doc/delete/:docId` | — | Delete a whole document |
-| `POST` | `/doc/search` | `{"question":"...","k":3}` | Retrieval only (no LLM) |
-| `POST` | `/doc/ask` | `{"question":"...","k":3}` | RAG: retrieve + generate |
-| `GET` | `/status` | — | Ollama status and model info |
+> Aura AI is developed and tested on macOS. The Windows and Linux steps use each platform's standard toolchain. If something doesn't build, please open an issue.
 
-### Example: Sign in, then search via curl
+1. **Install MSYS2 (the g++ compiler)**
+   - Download and run the installer from **https://www.msys2.org** (keep the default path `C:\msys64`).
+   - Open **MSYS2 UCRT64** from the Start menu and run:
+     ```bash
+     pacman -Syu
+     pacman -S mingw-w64-ucrt-x86_64-gcc
+     ```
+     (Close and reopen the terminal if `pacman -Syu` asks you to.)
+   - Add `C:\msys64\ucrt64\bin` to your Windows **PATH**: press `Win + R`, type `sysdm.cpl`, then go to **Advanced → Environment Variables → Path → Edit → New**.
+   - Open a **new** PowerShell and check: `g++ --version`
+2. **Install Git** from **https://git-scm.com/download/win** (default settings).
+3. **Install Ollama** from **https://ollama.com** (it runs in the system tray), then in PowerShell:
+   ```powershell
+   ollama pull nomic-embed-text
+   ollama pull llama3.2
+   ```
+4. **Get the code and build:**
+   ```powershell
+   git clone https://github.com/Rajveer-Singh-103900/Your-OWN-AI.git
+   cd Your-OWN-AI
+   g++ -std=c++17 -O2 main.cpp -o db -lws2_32
+   ```
+   This creates `db.exe`.
+
+### Linux
+
+Install `g++` (e.g. `sudo apt install g++`) and Ollama (`curl -fsSL https://ollama.com/install.sh | sh`), pull the two models as above, then:
 
 ```bash
-curl -c cookies.txt -X POST http://localhost:8080/auth/login \
-  -d '{"username":"alice","password":"your-password"}'
-
-curl -b cookies.txt "http://localhost:8080/search?v=0.9,0.8,0.7,0.6,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=3&metric=cosine&algo=hnsw"
-```
-
-### Example: Ask a question via curl
-
-```bash
-curl -b cookies.txt -X POST http://localhost:8080/doc/ask \
-  -d '{"question":"What is dynamic programming?","k":3}'
+g++ -std=c++17 -O2 main.cpp -o db -pthread
 ```
 
 ---
 
-## Project Structure
+## Running Aura AI
+
+1. **Make sure Ollama is running.** On macOS and Windows it runs in the menu bar or tray after you open it once. Otherwise start it in a terminal with `ollama serve`.
+2. **Start the server from the project folder** (it serves the web pages from there):
+   ```bash
+   cd Your-OWN-AI
+   ./db              # Windows: .\db.exe
+   ```
+   You should see:
+   ```
+   === Aura AI · VectorDB Engine ===
+   http://localhost:8080   (this computer only)
+   16D demo vectors | HNSW+KD-Tree+BruteForce | 0 registered user(s)
+   Ollama: ONLINE
+     embed model: nomic-embed-text  gen model: llama3.2
+   ```
+   Keep this terminal open. It also shows sign-in activity. Press **Ctrl + C** to stop the server.
+3. **Open http://localhost:8080** in your browser.
+
+### Command-line options
+
+| Command | What it does |
+|---|---|
+| `./db` | Start on port 8080, reachable **only from this computer** |
+| `./db 8090` | Use a different port |
+| `./db --lan` | Also allow other devices on your network (e.g. your phone at `http://<your-computer-ip>:8080`) |
+| `./db 8090 --lan` | Both |
+
+> **After changing the code**, rebuild **and restart** the server (Ctrl + C, then `./db`). A server that is still running keeps using the old program.
+
+---
+
+## Using the app
+
+### 1. Sign in
+
+![Sign-in page](docs/screenshots/login.png)
+
+The first time, click **CREATE ACCOUNT** and choose:
+- a **username**: 3–32 characters, letters, digits and `_ . -`
+- a **password**: at least 8 characters
+
+You are signed in straight away and stay signed in for 7 days (or until the server restarts). Your name and a **SIGN OUT** button appear in the top-right corner.
+
+### 2. Documents tab: add your knowledge
+
+![Documents tab with uploaded files](docs/screenshots/documents.png)
+
+- **Drag and drop files** onto the upload box, or click it to choose files. You can add many at once.
+- Each file shows its progress (*Reading page 3/12…*, *Embedding ~40 chunks…*) and then the result (*✓ 12 chunks · 2,431 words*), or a clear reason why it couldn't be read.
+- **✎ OR PASTE TEXT** lets you paste notes directly instead of uploading a file.
+- **Stored documents** lists everything you've added. The ✕ button deletes a document completely.
+- A file with the same name as a stored document is refused. Delete the old one first.
+- The **Ollama status** box shows whether the AI models are available.
+
+#### Supported formats
+
+| Type | Extensions | Notes |
+|---|---|---|
+| PDF | `.pdf` | Needs selectable text. Page numbers are kept. |
+| Word | `.docx`, `.doc` | Old Word 97–2003 `.doc` files work too. |
+| PowerPoint | `.pptx`, `.ppt` | Slide text and speaker notes, slide by slide. |
+| Spreadsheets | `.xlsx`, `.xls`, `.xlsb`, `.ods`, `.csv`, `.tsv` | Every sheet. Each row is stored as `Column: value \| Column: value`, so answers keep their context. |
+| OpenDocument | `.odt`, `.odp`, `.ods` | LibreOffice / OpenOffice files. |
+| Other documents | `.rtf`, `.epub`, `.html`, `.xml` | |
+| Text | `.txt`, `.md`, `.json`, `.log`, source code, … | Any text file (UTF-8, UTF-16 or Windows-1252). |
+
+The file type is detected from the file's **content**, not just its name, so a renamed file (e.g. a `.docx` saved as `.doc`) still works.
+
+**Not supported yet** (you get a clear message instead): scanned PDFs and images (these need OCR), password-protected files, Apple Pages/Keynote files (export them to PDF or Word first), audio/video, and `.zip` archives (unzip them first). One document can be up to about 440,000 words.
+
+### 3. Ask AI tab: ask questions
+
+1. Type a question about your documents. Press **Ctrl + Enter** or click **🤖 ASK AI**.
+2. Choose how many passages to use (**Top 2 / 3 / 5**).
+3. The answer appears with the model name and the **retrieved context**: chips like `#1 report.pdf [3/12] · 0.217`. Click a chip to read the exact passage. The number is the *distance*: smaller means more similar.
+4. On the map, a ★ marks your question and lines connect it to the documents that were used.
+
+The AI uses your documents when they contain relevant information, and otherwise answers from its general knowledge. Answers take a few seconds up to ~30 s on a laptop CPU.
+
+### 4. Search tab & the semantic map: see how vector search works
+
+This part is a small, visual **demo** of vector search, using 20 built-in example items in 4 categories (CS, Math, Food, Sports). Each item has 16 dimensions, 4 per category.
+
+- **Search:** type a concept (`binary tree`, `sushi`, `calculus`, `basketball`), choose an **algorithm** and a **distance metric**, and click **⚡ SEARCH**. Results show their distance, the matches glow on the map, and the search latency is shown in µs.
+- **▶ COMPARE ALL ALGOS** times HNSW, KD-Tree and Brute Force on the same query.
+- **HNSW graph layers** shows how many nodes and edges each layer of the HNSW graph has.
+- **Insert demo vector** adds your own item to the demo set.
+- **The map** is a 2-D projection (PCA) of all vectors. Items with similar meaning form clusters. Your uploaded documents appear as green dots.
+
+> In this demo the query text is turned into a vector with a simple keyword matcher in the browser, so you can see the algorithms at work without the AI. Your real documents use the real `nomic-embed-text` model (768 dimensions).
+
+---
+
+## Accounts & security
+
+| Protection | How |
+|---|---|
+| **Everything requires sign-in** | Every page, file and API endpoint except the sign-in page returns *401 Not signed in* (or redirects to `/login`) without a valid session. |
+| **Passwords are never stored** | Only a salted **PBKDF2-HMAC-SHA256** hash (200,000 rounds, random 16-byte salt per user) is saved. Checking a password takes ~0.3 s on purpose, which makes guessing slow. |
+| **Brute-force lockout** | 5 wrong passwords lock that username for 15 minutes, even for the correct password. Other users are unaffected. |
+| **No username guessing** | The error is always "Invalid username or password", and unknown usernames take exactly as long to check as real ones. |
+| **Secure sessions** | A random 256-bit token in a cookie with `HttpOnly` (JavaScript can't read it) and `SameSite=Strict` (other websites can't use it). Sign-out ends it immediately. |
+| **Private data per user** | Each account has its own documents and demo map. Users can't see, search or delete each other's data. |
+| **Local by default** | The server only accepts connections from your own computer unless you start it with `--lan`. |
+| **Safe display** | Document text is always shown as text, never as HTML, so a malicious file can't run code in the page. |
+
+### Sign-in activity log
+
+Every sign-in event is printed in the server's terminal and appended to **`auth.log`**:
+
+```
+2026-09-29 14:02:11  SIGNUP         priya            127.0.0.1        new account, signed in
+2026-09-29 14:05:02  LOGIN OK       priya            127.0.0.1
+2026-09-29 14:05:40  LOGIN FAILED   bob              127.0.0.1        wrong password (2/5)
+2026-09-29 14:06:12  LOGIN FAILED   ghost            127.0.0.1        no such user (1/5)
+2026-09-29 14:07:30  LOCKED         bob              127.0.0.1        too many failures, locked for 15 min
+2026-09-29 14:07:41  LOGIN BLOCKED  bob              127.0.0.1        account is locked
+2026-09-29 14:09:03  LOGOUT         priya            127.0.0.1
+```
+
+| To see… | Run (in the project folder) |
+|---|---|
+| the whole history | `cat auth.log` |
+| new events live | `tail -f auth.log` (Ctrl + C to stop) |
+| all registered accounts | `cut -d' ' -f1 users.txt` |
+
+Usernames in the log are cleaned (printable characters only, max 40), so nobody can forge log lines by typing a strange username.
+
+---
+
+## Where your data is stored
+
+Everything lives in the project folder, on your computer only. These files are **never committed to git**.
+
+| Path | Contents | Created |
+|---|---|---|
+| `users.txt` | One line per account: username + password hash (never the password) | on the first sign-up |
+| `data/<username>/` | That user's documents: one `.doc` file per document with its text chunks and embeddings | on the user's first upload |
+| `auth.log` | Sign-in activity log | on the first sign-in event |
+
+- **Restarting the server** keeps accounts and documents. Everyone just signs in again.
+- **Remove all accounts:** delete `users.txt`.
+- **Remove one user's documents:** delete `data/<username>/`.
+- **Forgot a password:** delete that user's line in `users.txt` and create the account again with the same username. Their documents in `data/<username>/` come back.
+- On macOS and Linux these files are readable only by your own user account.
+
+---
+
+## Configuration
+
+Most settings are constants in `main.cpp`. Change them, rebuild, and restart.
+
+| Setting | Default | Where |
+|---|---|---|
+| Port / network access | `8080`, this computer only | command line: `./db [port] [--lan]` |
+| Embedding model | `nomic-embed-text` | `OllamaClient::embedModel` |
+| Answer model | `llama3.2` | `OllamaClient::genModel` |
+| Ollama address | `127.0.0.1:11434` | `OllamaClient` constructor |
+| Chunk size / overlap | 250 / 30 words | `chunkText(text, 250, 30)` in `/doc/insert` |
+| Max. chunks per document | 2,000 (~440k words) | `MAX_DOC_CHUNKS` |
+| Relevance cut-off | cosine distance ≤ 0.7 | `DocumentDB::search` (`max_dist`) |
+| Exact search up to | 20,000 chunks per user (HNSW above) | `EXACT_SEARCH_MAX` |
+| Password hashing | PBKDF2-SHA256, 200,000 rounds | `UserStore::ITERATIONS` |
+| Lockout | 5 failures → 15 minutes | `UserStore::MAX_FAILS`, `LOCK_MINUTES` |
+| Session length | 7 days, renewed on use | `SessionStore::TTL_HOURS` |
+
+**Faster answers on a slow laptop:** run `ollama pull llama3.2:1b` and set `genModel = "llama3.2:1b"`.
+
+If you change the **embedding** model, documents embedded with the old model are skipped at start-up with a warning, because their vectors aren't comparable. Upload them again.
+
+---
+
+## REST API
+
+All endpoints are at `http://localhost:8080`. Request bodies are JSON. Errors are returned as `{"error": "..."}`.
+Every endpoint except `/login` and `/auth/*` needs a signed-in session cookie. Without one it returns `401`.
+
+### Authentication
+
+| Method | Endpoint | Body | Result |
+|---|---|---|---|
+| `POST` | `/auth/register` | `{"username","password"}` | Creates the account and signs in (sets cookie). `400` invalid, `409` taken. |
+| `POST` | `/auth/login` | `{"username","password"}` | Signs in (sets cookie). `401` wrong credentials, `429` locked. |
+| `POST` | `/auth/logout` | — | Ends the session. |
+| `GET` | `/auth/me` | — | `{"username": "..."}` |
+
+### Documents & RAG
+
+| Method | Endpoint | Body | Result |
+|---|---|---|---|
+| `POST` | `/doc/insert` | `{"title","text","kind"?,"map"?}` | Chunks, embeds, saves and stores a document (all-or-nothing). Returns `{docId, chunks, words, dims}`. `409` duplicate title, `413` too large, `503` Ollama unavailable. |
+| `GET` | `/doc/list` | — | Your documents: `docId, title, kind, chunks, words, preview` |
+| `DELETE` | `/doc/delete/:docId` | — | Deletes a whole document |
+| `POST` | `/doc/search` | `{"question","k"?}` | Most similar chunks only (no LLM) |
+| `POST` | `/doc/ask` | `{"question","k"?}` | Full RAG: `{answer, model, contexts[], docCount}` |
+| `GET` | `/status` | — | Ollama status, models, document/chunk counts |
+
+`kind` is a label such as `"PDF"`. `map` is an optional 16-number position on the demo map. `k` is 1–10 (default 3).
+
+### Demo vector search
+
+| Method | Endpoint | Result |
+|---|---|---|
+| `GET` | `/search?v=<16 comma-separated numbers>&k=5&metric=cosine&algo=hnsw` | k nearest demo vectors + latency. `metric`: `cosine`/`euclidean`/`manhattan`. `algo`: `hnsw`/`kdtree`/`bruteforce`. |
+| `GET` | `/benchmark?v=...&k=5&metric=cosine` | Time of each algorithm in µs |
+| `POST` | `/insert` | Add a demo vector: `{"metadata","category","embedding":[16 numbers]}` |
+| `DELETE` | `/delete/:id` | Remove a demo vector |
+| `GET` | `/items` | All demo vectors |
+| `GET` | `/hnsw-info` | HNSW layers, nodes and edges |
+| `GET` | `/stats` | Count, dimensions, algorithms, metrics |
+
+### Example with curl
+
+```bash
+# Sign in and keep the session cookie in cookies.txt
+curl -c cookies.txt -X POST http://localhost:8080/auth/login \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"priya","password":"my-password"}'
+
+# Add a document
+curl -b cookies.txt -X POST http://localhost:8080/doc/insert \
+     -H 'Content-Type: application/json' \
+     -d '{"title":"notes.txt","text":"The mitochondria is the powerhouse of the cell."}'
+
+# Ask a question
+curl -b cookies.txt -X POST http://localhost:8080/doc/ask \
+     -H 'Content-Type: application/json' \
+     -d '{"question":"What is the powerhouse of the cell?"}'
+```
+
+---
+
+## Project structure
 
 ```
 Your-OWN-AI/
-├── main.cpp        ← C++ backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
-├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
-├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark, uploads)
-├── login.html      ← Sign-in / create-account page
-├── users.txt       ← Accounts (created on first sign-up, not in git)
-├── data/           ← Saved documents per user (created on first upload, not in git)
-├── extract.js      ← Browser-side text extraction for uploaded documents
-├── vendor/         ← Document parsers: pdf.js, mammoth, SheetJS, JSZip
-└── README.md       ← This file
+├── main.cpp            C++ server: vector indexes, databases, Ollama client, accounts, REST API
+├── index.html          The app: search demo, semantic map, documents, Ask AI (HTML + CSS + JS)
+├── login.html          Sign-in / create-account page
+├── extract.js          Reads text out of uploaded files, in the browser
+├── httplib.h           cpp-httplib: single-header HTTP server (third-party)
+├── vendor/             Third-party document readers used by extract.js
+│   ├── pdf.min.js, pdf.worker.min.js   pdf.js: PDF
+│   ├── mammoth.browser.min.js          mammoth: Word .docx
+│   ├── xlsx.full.min.js                SheetJS: spreadsheets + old Office file container
+│   └── jszip.min.js                    JSZip: PowerPoint, OpenDocument, EPUB
+├── docs/screenshots/   Images used in this README
+└── README.md
+
+Created at runtime (not in git):
+├── db / db.exe         The compiled server
+├── users.txt           Accounts (password hashes)
+├── auth.log            Sign-in activity log
+└── data/<username>/    Saved documents
 ```
 
-### Architecture (main.cpp)
-
-```
-BruteForce          O(N·d)      Exact, baseline
-KDTree              O(log N)    Exact, axis-aligned partitioning
-HNSW                O(log N)    Approximate, multilayer small-world graph
-
-VectorDB            Unified interface over all 3 (16D demo vectors)
-DocumentDB          HNSW-only index for real Ollama embeddings (768D)
-OllamaClient        HTTP client → /api/embeddings + /api/generate
-```
+There is no build system, framework or package manager: one C++ file, one compiler command, and plain HTML/JavaScript.
 
 ---
 
-## Algorithm Deep Dive
+## Architecture
 
-### HNSW (Hierarchical Navigable Small World)
+```mermaid
+flowchart TB
+    subgraph Browser
+        L[login.html] --> UI[index.html]
+        UI --> X["extract.js<br/>+ vendor/ parsers"]
+    end
+    subgraph "C++ server (main.cpp)"
+        G{{"Auth gate<br/>session cookie"}} --> R[REST routes]
+        R --> US["UserSpace (one per user)"]
+        US --> V["VectorDB · demo<br/>HNSW + KD-Tree + BruteForce"]
+        US --> D["DocumentDB · your documents<br/>BruteForce / HNSW"]
+        R --> A["UserStore · SessionStore · AuthLog"]
+        R --> O[OllamaClient]
+    end
+    UI -->|"HTTP + cookie"| G
+    D <-->|"data/‹user›/*.doc"| DISK[(Disk)]
+    A <-->|"users.txt · auth.log"| DISK
+    O -->|"/api/embed · /api/generate"| OL["Ollama<br/>nomic-embed-text · llama3.2"]
+```
 
-Nodes are inserted into a multilayer graph. Each node randomly gets assigned a maximum layer. Layer 0 has all nodes with many connections; higher layers have fewer nodes (exponentially fewer) with longer-range connections.
-
-**Insert:** Start at the top layer, greedily find the nearest node, drop a layer, repeat. At each layer from your assigned max down to 0, run a beam search (ef_construction=200) and connect to the M nearest neighbors bidirectionally.
-
-**Search:** Same greedy descent from top layer. At layer 0, expand to ef nearest candidates using a priority queue.
-
-**Why it's fast:** The upper layers act like a highway — you quickly get to the right neighborhood, then zoom in at layer 0.
-
-### KD-Tree (K-Dimensional Tree)
-
-Binary space partitioning. Each node splits space along one dimension (cycling through all dimensions). Search prunes entire subtrees when the closest possible point in that subtree can't beat the current best — the "ball within hyperslab" check.
-
-**Weakness:** Degrades with high dimensions (curse of dimensionality). Works well for ≤20D, becomes close to brute force at 768D.
-
-### Why HNSW Wins at High Dimensions
-
-KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almost all the space is near the boundary of the hypersphere — no subtrees get pruned. HNSW's graph-based approach doesn't have this problem.
-
----
-
-## Common Issues
-
-| Problem | Fix |
+| Component (in `main.cpp`) | Role |
 |---|---|
-| `Ollama: OFFLINE` in header | Run `ollama serve` in a terminal |
-| Embedding takes forever | Ollama is downloading the model on first use, wait 2 min |
-| `g++: command not found` | Add `C:\msys64\ucrt64\bin` to Windows PATH |
-| Forgot password | Delete that user's line from `users.txt` and create the account again with the same username — their saved documents in `data/<username>/` come back |
-| Port 8080 already in use | Kill the process: `netstat -ano \| findstr 8080` then `taskkill /PID <pid> /F` |
-| LLM answer is slow | Normal — llama3.2 takes 10–30s on a laptop CPU. Use llama3.2:1b for faster answers |
+| `BruteForce`, `KDTree`, `HNSW` | The three nearest-neighbour indexes |
+| `VectorDB` | The 16-D demo database. Every item is in all three indexes so they can be compared. |
+| `DocumentDB` | Your documents: chunks, 768-D embeddings, search, and saving to / loading from `data/<user>/` |
+| `UserSpace` | One `VectorDB` + one `DocumentDB` per signed-in user, loaded on first use |
+| `OllamaClient` | Talks to Ollama: batch embeddings (`/api/embed`, 32 chunks per call) and answers (`/api/generate`) |
+| `UserStore` | Accounts in `users.txt`, PBKDF2 hashing, lockout |
+| `SessionStore` | Signed-in sessions (random tokens, in memory) |
+| `AuthLog` | The sign-in activity log |
+| `chunkText` | Splits text into overlapping 250-word chunks |
+| Auth gate | Runs before every request and lets only signed-in users through |
 
-### Use a Smaller/Faster LLM
+**The document pipeline in detail:**
 
-If llama3.2 is too slow on your laptop, switch to the 1B model:
-
-```powershell
-ollama pull llama3.2:1b
-```
-
-Then edit [main.cpp](main.cpp) line where `genModel` is set:
-```cpp
-std::string genModel = "llama3.2:1b";   // change this
-```
-Recompile and restart.
+1. `extract.js` detects the real file type from its bytes and extracts text with the matching reader. It uses pdf.js, mammoth, SheetJS and JSZip, plus small custom readers for old `.doc`/`.ppt` files and RTF. Output is Unicode-normalised, so, for example, PDF ligatures like "ﬁ" become "fi".
+2. The browser sends `{title, text, kind, map}` to `POST /doc/insert`.
+3. The server chunks the text and embeds all chunks in batches. **Only if every chunk succeeds** is the document written to disk and added to the index, so a failed upload never leaves half a document behind.
+4. `POST /doc/ask` embeds the question, retrieves the top-k chunks (cosine distance ≤ 0.7), builds a prompt with them, and asks `llama3.2`.
 
 ---
 
-## License
+## Algorithms explained
 
-MIT — use this however you want.
+### Distance metrics
+
+| Metric | Formula (idea) | Good for |
+|---|---|---|
+| **Cosine** | 1 − cos(angle between the vectors) | Text embeddings: compares *direction* (meaning), not length |
+| **Euclidean** | straight-line distance | Geometric data |
+| **Manhattan** | sum of absolute differences | Grid-like data, robust to outliers |
+
+### Brute Force: O(N·d)
+Compare the query with every vector and sort. Always exact, and the baseline the others are measured against.
+
+### KD-Tree: about O(log N) in low dimensions
+A binary tree that splits space along one dimension at a time (cycling through them). During search, whole branches are skipped when they can't contain anything closer than the best match so far. Very fast at low dimensions, but it degrades towards brute force as dimensions grow (the "curse of dimensionality"). At 768 dimensions almost nothing can be skipped.
+
+### HNSW (Hierarchical Navigable Small World): about O(log N)
+The algorithm behind Pinecone, Weaviate, Chroma and Milvus. Vectors are nodes in a **multi-layer graph**: the top layers are sparse "highways" with long links, and the bottom layer has every node with short links.
+
+- **Insert:** each node gets a random top layer. Starting at the top, greedily walk to the closest node, go down a layer, and repeat. On each layer the new node is linked to its nearest neighbours (M = 16, 32 on the bottom layer, found with a beam search of width 200).
+- **Search:** the same greedy descent, then a wider beam search (ef = 50) on the bottom layer.
+- **Why it's fast:** the upper layers get you to the right neighbourhood in a few hops, and the bottom layer refines the result.
+
+HNSW is **approximate**: it trades a little accuracy for a lot of speed. While testing Aura AI we found that this simple HNSW version could miss an "odd one out" chunk, often exactly the chunk holding a specific fact. **Document search therefore uses exact brute-force search up to 20,000 chunks per user** (a few milliseconds at that size) and switches to HNSW above that. The Search tab still lets you compare all three algorithms.
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Browser shows *This site can't be reached* | The server isn't running. Start it with `./db` **from the project folder**. |
+| Blank page or *404* | You started `./db` from another folder. `cd` into `Your-OWN-AI` first. |
+| Header shows **OLLAMA ✗** | Open the Ollama app, or run `ollama serve`. |
+| *Ollama model '…' is missing* | Run `ollama pull nomic-embed-text` and `ollama pull llama3.2`. |
+| *The document reader did not load* | An old server is still running from before an update. Stop it (Ctrl + C) and start `./db` again, then refresh with Cmd/Ctrl + Shift + R. |
+| Changes to the code don't show up | Rebuild **and** restart the server, then hard-refresh the browser. |
+| *could not listen on port 8080* | Something else uses the port. Stop it (macOS/Linux: `lsof -ti :8080 \| xargs kill`; Windows: `netstat -ano \| findstr 8080`, then `taskkill /PID <pid> /F`) or use `./db 8090`. |
+| *Too many failed attempts* | Wait 15 minutes, or restart the server (lockouts are kept in memory). |
+| Forgot password | Delete the user's line in `users.txt` and sign up again with the same username. Documents are kept. |
+| *This PDF has no selectable text* | It's a scanned PDF (images). OCR isn't supported yet. |
+| First upload is slow | Ollama loads the model on first use. Wait a moment. |
+| Answers take 10–30 s | Normal on a laptop CPU. Use `llama3.2:1b` for faster answers (see [Configuration](#configuration)). |
+| `g++: command not found` (Windows) | Add `C:\msys64\ucrt64\bin` to PATH and open a new terminal. |
+| `undefined reference to WSA…` (Windows) | Add `-lws2_32` to the build command. |
+
+---
+
+## Limitations & roadmap
+
+**Current limitations**
+- Scanned PDFs and images can't be read yet (no OCR).
+- Password-protected files, Apple Pages/Keynote, audio/video and archives aren't supported.
+- There is no "forgot password" flow, account deletion or admin page. Anyone who can reach the server can create an account, which is why the server is local-only by default.
+- It serves plain HTTP. That's fine on your own computer, but exposing it to the internet would need HTTPS.
+- Sessions and lockouts are kept in memory, so everyone signs in again after a restart.
+- Demo vectors you insert by hand in the Search tab are not saved.
+- The HNSW implementation uses simple neighbour selection. The improved heuristic from the HNSW paper would make it reliable enough for document search at every size.
+
+**Ideas for the future**
+- OCR for scanned PDFs and images
+- An admin page: accounts, who is signed in, recent activity
+- Streaming answers token by token
+- Improved HNSW neighbour selection
+- Hosting with HTTPS for access from anywhere
+
+---
+
+## Credits & license
+
+Built with:
+- [cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT): HTTP server
+- [Ollama](https://ollama.com) with [nomic-embed-text](https://ollama.com/library/nomic-embed-text) and [Llama 3.2](https://ollama.com/library/llama3.2): local AI models
+- [pdf.js](https://mozilla.github.io/pdf.js/) (Apache-2.0), [mammoth.js](https://github.com/mwilliamson/mammoth.js) (BSD-2-Clause), [SheetJS](https://sheetjs.com) (Apache-2.0), [JSZip](https://stuk.github.io/jszip/) (MIT/GPLv3): document readers
+- [Fira Code](https://github.com/tonsky/FiraCode) font
+
+The Aura AI source code is released under the **MIT License**. Use it however you like.
