@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aura AI — Sign in</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:     #07070f;
+  --card:   #0c0c18;
+  --border: #151528;
+  --cs:     #00d9ff;
+  --math:   #b388ff;
+  --accent: #6c63ff;
+  --text:   #cdd6f4;
+  --muted:  #4a4a6a;
+  --red:    #f38ba8;
+  --green:  #a6e3a1;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: radial-gradient(ellipse at 50% 30%, #11112a 0%, var(--bg) 60%);
+  color: var(--text); font-family: 'Fira Code', 'Courier New', monospace;
+  min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px;
+}
+.card {
+  width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 32px 28px; box-shadow: 0 0 60px rgba(108,99,255,.08);
+}
+h1 {
+  font-size: 22px; font-weight: 600; letter-spacing: 5px; text-align: center; margin-bottom: 6px;
+  background: linear-gradient(90deg, var(--cs), var(--accent), var(--math));
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.sub { text-align: center; font-size: 10px; letter-spacing: 2px; color: var(--muted); margin-bottom: 26px; }
+.tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 22px; }
+.tab { flex: 1; padding: 9px 4px; text-align: center; font-size: 10px; letter-spacing: 1.5px; cursor: pointer;
+  color: var(--muted); border-bottom: 2px solid transparent; background: none; border-top: none; border-left: none;
+  border-right: none; font-family: inherit; transition: all .2s; }
+.tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+form { display: flex; flex-direction: column; gap: 14px; }
+label { font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 6px; }
+input {
+  width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 10px 12px; border-radius: 6px; font-family: inherit; font-size: 13px; outline: none; transition: border-color .2s;
+}
+input:focus { border-color: var(--accent); }
+.hint { font-size: 9px; color: var(--muted); margin-top: 5px; }
+button[type=submit] {
+  margin-top: 4px; padding: 11px 14px; border: none; border-radius: 6px; cursor: pointer; font-family: inherit;
+  font-size: 12px; font-weight: 500; letter-spacing: 1px; color: #fff;
+  background: linear-gradient(135deg, var(--accent), #4f46e5); box-shadow: 0 0 18px rgba(108,99,255,.3); transition: all .2s;
+}
+button[type=submit]:hover { box-shadow: 0 0 28px rgba(108,99,255,.55); transform: translateY(-1px); }
+button[type=submit]:disabled { opacity: .5; transform: none; cursor: wait; }
+.msg { font-size: 11px; line-height: 1.5; min-height: 16px; }
+.msg.err { color: var(--red); }
+.foot { margin-top: 22px; font-size: 9px; color: var(--muted); text-align: center; line-height: 1.6; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1>Aura AI</h1>
+  <div class="sub">YOUR PRIVATE DOCUMENT ASSISTANT</div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab on" id="tabLogin" type="button" onclick="setMode('login')">SIGN IN</button>
+    <button class="tab"    id="tabRegister" type="button" onclick="setMode('register')">CREATE ACCOUNT</button>
+  </div>
+
+  <form id="authForm" novalidate>
+    <div>
+      <label for="username">Username</label>
+      <input id="username" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      <div class="hint" id="userHint" hidden>3–32 characters: letters, digits, _ . -</div>
+    </div>
+    <div>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <div class="hint" id="pwHint" hidden>At least 8 characters</div>
+    </div>
+    <div id="confirmRow" hidden>
+      <label for="confirm">Confirm password</label>
+      <input id="confirm" type="password" autocomplete="new-password">
+    </div>
+    <button type="submit" id="submitBtn">SIGN IN</button>
+    <div class="msg" id="msg" role="alert"></div>
+  </form>
+
+  <div class="foot">Each account has its own private documents.<br>Passwords are stored as salted PBKDF2 hashes.</div>
+</main>
+
+<script>
+let mode = 'login';
+
+function setMode(m) {
+  mode = m;
+  const reg = m === 'register';
+  document.getElementById('tabLogin').classList.toggle('on', !reg);
+  document.getElementById('tabRegister').classList.toggle('on', reg);
+  document.getElementById('confirmRow').hidden = !reg;
+  document.getElementById('userHint').hidden = !reg;
+  document.getElementById('pwHint').hidden = !reg;
+  document.getElementById('password').autocomplete = reg ? 'new-password' : 'current-password';
+  document.getElementById('submitBtn').textContent = reg ? 'CREATE ACCOUNT' : 'SIGN IN';
+  showMsg('');
+  document.getElementById('username').focus();
+}
+
+function showMsg(text) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg' + (text ? ' err' : '');
+}
+
+document.getElementById('authForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  if (!username || !password) return showMsg('Enter a username and password.');
+  if (mode === 'register') {
+    if (password.length < 8) return showMsg('Password must be at least 8 characters.');
+    if (password !== document.getElementById('confirm').value) return showMsg('Passwords do not match.');
+  }
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true; showMsg('');
+  try {
+    const r = await fetch('/auth/' + mode, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const d = await r.json();
+    if (d.error) { showMsg(d.error); btn.disabled = false; return; }
+    location.replace('/');
+  } catch (_) {
+    showMsg('Cannot reach the server — is ./db running?');
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('username').focus();
+</script>
+</body>
+</html>

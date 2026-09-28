@@ -19,3 +19,7 @@ Thumbs.db
 
 # Server binary (macOS/Linux build output)
 /db
+
+# Local accounts (password hashes) — never commit
+users.txt
+users.txt.tmp

@@ -17,6 +17,7 @@ Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-
 | **2D PCA Scatter Plot** | Live visualization of semantic space — watch clusters form |
 | **Upload Any Document** | PDF, Word, PowerPoint, Excel, CSV, OpenDocument, RTF, EPUB, HTML, TXT/Markdown, code — text is extracted in the browser and embedded with `nomic-embed-text` (768D) |
 | **RAG Pipeline** | Ask questions about your documents → HNSW retrieves context → local LLM answers |
+| **User Accounts** | Sign in / create account; each user has private documents. Salted PBKDF2 password hashes, session cookies, lockout after 5 failed logins |
 | **Full REST API** | CRUD endpoints: insert, delete, search, benchmark, hnsw-info |
 
 ---
@@ -151,7 +152,7 @@ This produces `db.exe`. It takes about 10–20 seconds.
 
 > **macOS / Linux:** `clang++ -std=c++17 -O2 main.cpp -o db` (Linux: `g++ -std=c++17 -O2 main.cpp -o db -pthread`).
 > Always start the server **from the project folder** — it serves `index.html`, `extract.js` and `vendor/` from there.
-> To use another port: `./db 8090`.
+> To use another port: `./db 8090`. To allow other devices on your network: `./db --lan`.
 
 > **Troubleshooting:**
 > - `g++: command not found` → MSYS2 not in PATH, redo Step 1 point 5
@@ -186,6 +187,14 @@ Ollama: ONLINE
 ```
 http://localhost:8080
 ```
+
+You'll see the **Aura AI sign-in page**. The first time, click **CREATE ACCOUNT**, pick a username
+(3–32 letters/digits/`_.-`) and a password (8+ characters). You're signed in straight away.
+
+- Accounts are saved in `users.txt` in the project folder (password **hashes** only, never the passwords). Delete that file to remove all accounts.
+- Each account has its own documents and demo map. Other users can't see or search them.
+- 5 wrong passwords lock that username for 15 minutes.
+- By default the server only accepts connections **from this computer**. To let other devices on your Wi-Fi reach it (for example a phone), start it with `./db --lan`.
 
 ---
 
@@ -261,6 +270,17 @@ The server exposes a full REST API at `http://localhost:8080`.
 | `GET` | `/hnsw-info` | HNSW graph structure and layer stats |
 | `GET` | `/stats` | Database statistics |
 
+### Auth Endpoints
+
+Every other endpoint requires a signed-in session (cookie `aura_session`); without one they return `401`.
+
+| Method | Endpoint | Body | Description |
+|---|---|---|---|
+| `POST` | `/auth/register` | `{"username":"...","password":"..."}` | Create account and sign in |
+| `POST` | `/auth/login` | `{"username":"...","password":"..."}` | Sign in (sets session cookie) |
+| `POST` | `/auth/logout` | — | Sign out |
+| `GET` | `/auth/me` | — | Current username |
+
 ### Document & RAG Endpoints
 
 | Method | Endpoint | Body | Description |
@@ -272,17 +292,19 @@ The server exposes a full REST API at `http://localhost:8080`.
 | `POST` | `/doc/ask` | `{"question":"...","k":3}` | RAG: retrieve + generate |
 | `GET` | `/status` | — | Ollama status and model info |
 
-### Example: Search via curl
+### Example: Sign in, then search via curl
 
-```powershell
-curl "http://localhost:8080/search?v=0.9,0.8,0.7,0.6,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=3&metric=cosine&algo=hnsw"
+```bash
+curl -c cookies.txt -X POST http://localhost:8080/auth/login \
+  -d '{"username":"alice","password":"your-password"}'
+
+curl -b cookies.txt "http://localhost:8080/search?v=0.9,0.8,0.7,0.6,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=3&metric=cosine&algo=hnsw"
 ```
 
 ### Example: Ask a question via curl
 
-```powershell
-curl -X POST http://localhost:8080/doc/ask `
-  -H "Content-Type: application/json" `
+```bash
+curl -b cookies.txt -X POST http://localhost:8080/doc/ask \
   -d '{"question":"What is dynamic programming?","k":3}'
 ```
 
@@ -295,6 +317,7 @@ Your-OWN-AI/
 ├── main.cpp        ← C++ backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
 ├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
 ├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark, uploads)
+├── login.html      ← Sign-in / create-account page
 ├── extract.js      ← Browser-side text extraction for uploaded documents
 ├── vendor/         ← Document parsers: pdf.js, mammoth, SheetJS, JSZip
 └── README.md       ← This file
@@ -345,6 +368,7 @@ KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almo
 | `Ollama: OFFLINE` in header | Run `ollama serve` in a terminal |
 | Embedding takes forever | Ollama is downloading the model on first use, wait 2 min |
 | `g++: command not found` | Add `C:\msys64\ucrt64\bin` to Windows PATH |
+| Forgot password | Delete that user's line from `users.txt` and create the account again (their documents are lost on restart anyway) |
 | Port 8080 already in use | Kill the process: `netstat -ano \| findstr 8080` then `taskkill /PID <pid> /F` |
 | LLM answer is slow | Normal — llama3.2 takes 10–30s on a laptop CPU. Use llama3.2:1b for faster answers |
 

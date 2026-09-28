@@ -44,6 +44,10 @@ header h1 {
 .badge.ok { border-color: var(--green); color: var(--green); background: rgba(166,227,161,.1); }
 .badge.err { border-color: var(--red); color: var(--red); background: rgba(243,139,168,.1); }
 #statsLabel { margin-left: auto; font-size: 11px; color: var(--muted); }
+.user { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text); padding-left: 12px; border-left: 1px solid var(--border); }
+.user::before { content: '●'; color: var(--green); font-size: 8px; }
+.logout { width: auto; padding: 4px 10px; font-size: 10px; letter-spacing: 1px; background: var(--border); color: var(--muted); }
+.logout:hover { color: var(--text); background: #1c1c35; }
 
 /* ── LAYOUT ── */
 .layout { display: flex; flex: 1; overflow: hidden; }
@@ -186,6 +190,7 @@ details.paste[open] summary { color: var(--text); }
   <span class="badge">BRUTE FORCE</span>
   <span class="badge" id="ollamaBadge">OLLAMA…</span>
   <span id="statsLabel">loading…</span>
+  <span class="user"><span id="userName"></span><button class="logout" onclick="logout()">SIGN OUT</button></span>
 </header>
 
 <div class="layout">
@@ -364,7 +369,24 @@ details.paste[open] summary { color: var(--text); }
 // ════════════════════════════════════════════════════════════
 //  CONSTANTS
 // ════════════════════════════════════════════════════════════
-const API  = location.protocol.startsWith('http') ? '' : 'http://localhost:8080';   // same origin when served by ./db
+const API  = '';   // same origin: the page is served by ./db
+
+// Every API call needs a signed-in session; if it has expired, go back to the login page
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const r = await _fetch(...args);
+  if (r.status === 401) location.replace('/login');
+  return r;
+};
+
+async function loadUser() {
+  try { const d = await (await fetch('/auth/me')).json(); document.getElementById('userName').textContent = d.username; } catch(_) {}
+}
+
+async function logout() {
+  try { await fetch('/auth/logout', {method: 'POST'}); } catch(_) {}
+  location.replace('/login');
+}
 const DIMS = 16;
 const COL  = { cs:'#00d9ff', math:'#b388ff', food:'#ffb74d', sports:'#69f0ae', doc:'#a6e3a1', default:'#90a4ae' };
 const DIM_COL = ['#00d9ff','#00d9ff','#00d9ff','#00d9ff','#b388ff','#b388ff','#b388ff','#b388ff',
@@ -963,6 +985,7 @@ function toggleCtx(i) {
 //  BOOT
 // ════════════════════════════════════════════════════════════
 resize(); drawFrame();
+loadUser();
 loadItems().then(loadHNSW);
 checkOllamaStatus();
 </script>

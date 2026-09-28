@@ -19,6 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
+#include <array>
+#include <stdexcept>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 static const int DIMS = 16;   // demo vectors
 // Doc embeddings dimension is determined at runtime from Ollama's model output
@@ -616,12 +621,6 @@ size_t countWords(const std::string& s) {
     return n;
 }
 
-void cors(httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin",  "*");
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
-}
-
 // =====================================================================
 //  TEXT CHUNKER
 // =====================================================================
@@ -944,37 +943,362 @@ void loadDemo(VectorDB& db) {
 }
 
 // =====================================================================
+//  AUTH — password hashing (PBKDF2-HMAC-SHA256), users, sessions
+// =====================================================================
+
+// SHA-256 (FIPS 180-4), self-contained so the build needs no crypto library
+struct Sha256 {
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    uint8_t  buf[64]; size_t blen = 0; uint64_t total = 0;
+
+    static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+    void block(const uint8_t* p) {
+        static const uint32_t K[64] = {
+            0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+            0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+            0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+            0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+            0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+            0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+            0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+            0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t)p[4*i] << 24 | p[4*i+1] << 16 | p[4*i+2] << 8 | p[4*i+3];
+        for (int i = 16; i < 64; i++) {
+            uint32_t s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3);
+            uint32_t s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0], b=h[1], c=h[2], d=h[3], e=h[4], f=h[5], g=h[6], hh=h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = hh + (rotr(e,6) ^ rotr(e,11) ^ rotr(e,25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+            uint32_t t2 = (rotr(a,2) ^ rotr(a,13) ^ rotr(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    void update(const uint8_t* p, size_t n) {
+        total += n;
+        while (n--) { buf[blen++] = *p++; if (blen == 64) { block(buf); blen = 0; } }
+    }
+    std::array<uint8_t, 32> digest() {
+        uint64_t bits = total * 8;
+        uint8_t pad = 0x80; update(&pad, 1);
+        uint8_t z = 0; while (blen != 56) update(&z, 1);
+        for (int i = 7; i >= 0; i--) { uint8_t b = (uint8_t)(bits >> (8 * i)); update(&b, 1); }
+        std::array<uint8_t, 32> out;
+        for (int i = 0; i < 8; i++) for (int j = 0; j < 4; j++) out[4*i+j] = (uint8_t)(h[i] >> (24 - 8*j));
+        return out;
+    }
+};
+
+using Bytes = std::vector<uint8_t>;
+
+static std::array<uint8_t, 32> hmacSha256(const Bytes& key, const uint8_t* msg, size_t n) {
+    uint8_t k[64] = {0};
+    if (key.size() > 64) { Sha256 s; s.update(key.data(), key.size()); auto d = s.digest(); std::copy(d.begin(), d.end(), k); }
+    else std::copy(key.begin(), key.end(), k);
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    Sha256 in; in.update(ipad, 64); in.update(msg, n); auto ih = in.digest();
+    Sha256 out; out.update(opad, 64); out.update(ih.data(), 32);
+    return out.digest();
+}
+
+// PBKDF2-HMAC-SHA256 with a 32-byte output (RFC 8018)
+static Bytes pbkdf2(const std::string& password, const Bytes& salt, int iterations) {
+    Bytes key(password.begin(), password.end()), msg(salt);
+    msg.insert(msg.end(), {0, 0, 0, 1});                      // block index 1
+    auto u = hmacSha256(key, msg.data(), msg.size());
+    Bytes t(u.begin(), u.end());
+    for (int i = 1; i < iterations; i++) {
+        u = hmacSha256(key, u.data(), u.size());
+        for (int j = 0; j < 32; j++) t[j] ^= u[j];
+    }
+    return t;
+}
+
+static Bytes randomBytes(size_t n) {
+    Bytes b(n);
+#ifdef _WIN32
+    std::random_device rd;                                     // BCryptGenRandom on MinGW/MSVC
+    for (auto& x : b) x = (uint8_t)rd();
+#else
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    f.read((char*)b.data(), (std::streamsize)n);
+    if (!f) throw std::runtime_error("cannot read /dev/urandom");
+#endif
+    return b;
+}
+
+static std::string toHex(const Bytes& b) {
+    static const char* d = "0123456789abcdef";
+    std::string s;
+    for (uint8_t x : b) { s += d[x >> 4]; s += d[x & 15]; }
+    return s;
+}
+
+static Bytes fromHex(const std::string& s) {
+    Bytes b;
+    for (size_t i = 0; i + 1 < s.size(); i += 2) b.push_back((uint8_t)std::stoi(s.substr(i, 2), nullptr, 16));
+    return b;
+}
+
+static bool constTimeEq(const Bytes& a, const Bytes& b) {
+    if (a.size() != b.size()) return false;
+    uint8_t r = 0;
+    for (size_t i = 0; i < a.size(); i++) r |= a[i] ^ b[i];
+    return r == 0;
+}
+
+// Registered users, persisted to users.txt as: <username> pbkdf2-sha256 <iterations> <salt hex> <hash hex>
+class UserStore {
+    struct User { int iterations; Bytes salt, hash; };
+    struct Throttle { int fails = 0; std::chrono::steady_clock::time_point lockedUntil; };
+    std::map<std::string, User> users;
+    std::map<std::string, Throttle> throttle;
+    std::string path;
+    std::mutex mu;
+
+    static const int ITERATIONS   = 200000;
+    static const int MAX_FAILS    = 5;
+    static const int LOCK_MINUTES = 15;
+
+    void save() {                                   // write-then-rename so a crash can't truncate the file
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            for (auto& [name, u] : users)
+                f << name << " pbkdf2-sha256 " << u.iterations << ' ' << toHex(u.salt) << ' ' << toHex(u.hash) << '\n';
+        }
+#ifndef _WIN32
+        ::chmod(tmp.c_str(), 0600);
+#endif
+        std::remove(path.c_str());
+        std::rename(tmp.c_str(), path.c_str());
+    }
+
+public:
+    explicit UserStore(std::string p) : path(std::move(p)) {
+        std::ifstream f(path);
+        std::string name, algo, salt, hash; int it;
+        while (f >> name >> algo >> it >> salt >> hash)
+            if (algo == "pbkdf2-sha256") users[name] = {it, fromHex(salt), fromHex(hash)};
+    }
+
+    size_t count() { std::lock_guard<std::mutex> lk(mu); return users.size(); }
+
+    static std::string validate(const std::string& name, const std::string& pw) {
+        if (name.size() < 3 || name.size() > 32) return "Username must be 3–32 characters";
+        for (char c : name)
+            if (!std::isalnum((unsigned char)c) && c != '_' && c != '.' && c != '-')
+                return "Username may only contain letters, digits, _ . -";
+        if (pw.size() < 8)   return "Password must be at least 8 characters";
+        if (pw.size() > 256) return "Password is too long";
+        return "";
+    }
+
+    // Returns "" on success or an error message
+    std::string create(const std::string& name, const std::string& pw) {
+        auto err = validate(name, pw);
+        if (!err.empty()) return err;
+        auto salt = randomBytes(16);
+        auto hash = pbkdf2(pw, salt, ITERATIONS);             // slow on purpose: done outside the lock
+        std::lock_guard<std::mutex> lk(mu);
+        if (users.count(name)) return "That username is taken";
+        users[name] = {ITERATIONS, salt, hash};
+        save();
+        return "";
+    }
+
+    // Returns "" on success or an error message (same message for unknown user / wrong password)
+    std::string check(const std::string& name, const std::string& pw) {
+        User u; bool known;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto& t = throttle[name];
+            auto now = std::chrono::steady_clock::now();
+            if (t.fails >= MAX_FAILS && now < t.lockedUntil)
+                return "Too many failed attempts. Try again in " + std::to_string(LOCK_MINUTES) + " minutes.";
+            known = users.count(name) > 0;
+            u = known ? users[name] : User{ITERATIONS, Bytes(16, 0), Bytes(32, 0)};
+        }
+        // Hash even for unknown users so response time doesn't reveal which usernames exist
+        bool ok = constTimeEq(pbkdf2(pw, u.salt, u.iterations), u.hash) && known;
+        std::lock_guard<std::mutex> lk(mu);
+        auto& t = throttle[name];
+        if (ok) { t = Throttle(); return ""; }
+        if (t.fails >= MAX_FAILS) t.fails = 0;                 // previous lock expired: new window
+        if (++t.fails >= MAX_FAILS)
+            t.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(LOCK_MINUTES);
+        return "Invalid username or password";
+    }
+};
+
+// Signed-in sessions: random token (in an HttpOnly cookie) → username. In memory only.
+class SessionStore {
+    struct S { std::string user; std::chrono::steady_clock::time_point expires; };
+    std::unordered_map<std::string, S> sessions;
+    std::mutex mu;
+
+public:
+    static constexpr const char* COOKIE = "aura_session";
+    static const int TTL_HOURS = 24 * 7;                       // sliding: renewed on every request
+
+    std::string create(const std::string& user) {
+        auto token = toHex(randomBytes(32));
+        std::lock_guard<std::mutex> lk(mu);
+        sessions[token] = {user, std::chrono::steady_clock::now() + std::chrono::hours(TTL_HOURS)};
+        return token;
+    }
+
+    static std::string tokenOf(const httplib::Request& req) {
+        auto c = req.get_header_value("Cookie");
+        std::string key = std::string(COOKIE) + "=";
+        for (size_t p = 0; p < c.size(); ) {
+            while (p < c.size() && (c[p] == ' ' || c[p] == ';')) p++;
+            size_t e = c.find(';', p);
+            if (e == std::string::npos) e = c.size();
+            if (c.compare(p, key.size(), key) == 0) return c.substr(p + key.size(), e - p - key.size());
+            p = e;
+        }
+        return "";
+    }
+
+    // Username for this request, or "" if not signed in
+    std::string user(const httplib::Request& req) {
+        auto token = tokenOf(req);
+        if (token.empty()) return "";
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = sessions.find(token);
+        if (it == sessions.end()) return "";
+        auto now = std::chrono::steady_clock::now();
+        if (now > it->second.expires) { sessions.erase(it); return ""; }
+        it->second.expires = now + std::chrono::hours(TTL_HOURS);
+        return it->second.user;
+    }
+
+    void destroy(const httplib::Request& req) {
+        std::lock_guard<std::mutex> lk(mu);
+        sessions.erase(tokenOf(req));
+    }
+};
+
+// Each user gets their own demo vectors and documents
+struct UserSpace {
+    VectorDB   db{DIMS};
+    DocumentDB docs;
+    UserSpace() { loadDemo(db); }
+};
+
+// =====================================================================
 //  HTTP SERVER
 // =====================================================================
 
 int main(int argc, char** argv) {
-    int port = argc > 1 ? std::atoi(argv[1]) : 8080;   // ./db [port]
-    VectorDB   db(DIMS);
-    DocumentDB docDB;
-    OllamaClient ollama;
+    // ./db [port] [--lan]     --lan also accepts connections from other devices on the network
+    int  port = 8080;
+    bool lan  = false;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--lan") lan = true;
+        else if (std::isdigit((unsigned char)a[0])) port = std::atoi(a.c_str());
+        else { std::cerr << "usage: ./db [port] [--lan]" << std::endl; return 1; }
+    }
 
-    loadDemo(db);
+    OllamaClient ollama;
+    UserStore    users("users.txt");
+    SessionStore sessions;
+
+    std::map<std::string, std::unique_ptr<UserSpace>> spaces;
+    std::mutex spacesMu;
+    // Data space of the signed-in user (the auth gate below guarantees there is one)
+    auto space = [&](const httplib::Request& req) -> UserSpace& {
+        auto name = sessions.user(req);
+        if (name.empty()) throw std::runtime_error("not signed in");
+        std::lock_guard<std::mutex> lk(spacesMu);
+        auto& sp = spaces[name];
+        if (!sp) sp = std::make_unique<UserSpace>();
+        return *sp;
+    };
 
     // Check Ollama at startup (non-fatal)
     bool ollamaUp = ollama.isAvailable();
-    std::cout << "=== VectorDB Engine ===" << std::endl;
-    std::cout << "http://localhost:" << port << std::endl;
-    std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
+    std::cout << "=== Aura AI · VectorDB Engine ===" << std::endl;
+    std::cout << "http://localhost:" << port
+              << (lan ? "   (LAN access ON: other devices on your network can reach the login page)" : "   (this computer only)")
+              << std::endl;
+    std::cout << DIMS << "D demo vectors | HNSW+KD-Tree+BruteForce | "
+              << users.count() << " registered user(s)" << std::endl;
     std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
     if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
                             << "  gen model: "   << ollama.genModel << std::endl;
 
     httplib::Server svr;
 
-    // CORS preflight
-    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
-        cors(res); res.status = 204;
+    auto jsonErr = [](httplib::Response& res, int status, const std::string& msg) {
+        res.status = status;
+        res.set_content("{\"error\":" + jS(msg) + "}", "application/json");
+    };
+
+    // ── AUTH GATE ─────────────────────────────────────────────────────
+    // Runs before every route and static file. Only the login page and
+    // the auth endpoints are reachable without a valid session.
+    static const std::set<std::string> PUBLIC = {
+        "/login", "/auth/login", "/auth/register", "/auth/logout", "/favicon.ico" };
+    svr.set_pre_routing_handler([&](const httplib::Request& req, httplib::Response& res) {
+        if (PUBLIC.count(req.path) || !sessions.user(req).empty())
+            return httplib::Server::HandlerResponse::Unhandled;
+        if (req.method == "GET" && req.path == "/") res.set_redirect("/login");
+        else jsonErr(res, 401, "Not signed in");
+        return httplib::Server::HandlerResponse::Handled;
+    });
+    svr.set_exception_handler([&](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
+        jsonErr(res, 500, "Internal error");
+    });
+
+    auto setSessionCookie = [](httplib::Response& res, const std::string& token, int maxAge) {
+        res.set_header("Set-Cookie", std::string(SessionStore::COOKIE) + "=" + token +
+                       "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + std::to_string(maxAge));
+    };
+    auto signIn = [&](httplib::Response& res, const std::string& name) {
+        setSessionCookie(res, sessions.create(name), SessionStore::TTL_HOURS * 3600);
+        res.set_content("{\"username\":" + jS(name) + "}", "application/json");
+    };
+
+    // POST /auth/register {"username":"...","password":"..."}  — creates the account and signs in
+    svr.Post("/auth/register", [&](const httplib::Request& req, httplib::Response& res) {
+        auto name = extractStr(req.body, "username"), pw = extractStr(req.body, "password");
+        auto err = users.create(name, pw);
+        if (!err.empty()) return jsonErr(res, err.find("taken") != std::string::npos ? 409 : 400, err);
+        std::cout << "New user registered: " << name << std::endl;
+        signIn(res, name);
+    });
+
+    // POST /auth/login {"username":"...","password":"..."}
+    svr.Post("/auth/login", [&](const httplib::Request& req, httplib::Response& res) {
+        auto name = extractStr(req.body, "username"), pw = extractStr(req.body, "password");
+        auto err = users.check(name, pw);
+        if (!err.empty()) return jsonErr(res, err.find("Too many") != std::string::npos ? 429 : 401, err);
+        signIn(res, name);
+    });
+
+    // POST /auth/logout
+    svr.Post("/auth/logout", [&](const httplib::Request& req, httplib::Response& res) {
+        sessions.destroy(req);
+        setSessionCookie(res, "", 0);
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+
+    // GET /auth/me
+    svr.Get("/auth/me", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_content("{\"username\":" + jS(sessions.user(req)) + "}", "application/json");
     });
 
     // ── DEMO VECTOR ENDPOINTS ─────────────────────────────────────────
 
     svr.Get("/search", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         auto q = parseVec(req.get_param_value("v"));
         if ((int)q.size() != DIMS) {
             res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
@@ -985,7 +1309,7 @@ int main(int argc, char** argv) {
         auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
         auto algo   = req.get_param_value("algo");   if (algo.empty())   algo   = "hnsw";
 
-        auto out = db.search(q, k, metric, algo);
+        auto out = sp.db.search(q, k, metric, algo);
         std::ostringstream ss;
         ss << "{\"results\":[";
         for (size_t i = 0; i < out.hits.size(); i++) {
@@ -1004,26 +1328,26 @@ int main(int argc, char** argv) {
     });
 
     svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         std::string meta, cat; std::vector<float> emb;
         if (!parseBody(req.body, meta, cat, emb) || (int)emb.size() != DIMS) {
             res.set_content("{\"error\":\"invalid body\"}", "application/json"); return;
         }
-        int id = db.insert(meta, cat, emb, getDistFn("cosine"));
+        int id = sp.db.insert(meta, cat, emb, getDistFn("cosine"));
         res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
     });
 
     svr.Delete(R"(/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         int id  = std::stoi(req.matches[1]);
-        bool ok = db.remove(id);
+        bool ok = sp.db.remove(id);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
 
-    svr.Get("/items", [&](const httplib::Request&, httplib::Response& res) {
-        cors(res);
-        auto items = db.all();
+    svr.Get("/items", [&](const httplib::Request& req, httplib::Response& res) {
+        auto& sp = space(req);
+        auto items = sp.db.all();
         std::ostringstream ss; ss << '[';
         for (size_t i = 0; i < items.size(); i++) {
             if (i) ss << ',';
@@ -1038,7 +1362,7 @@ int main(int argc, char** argv) {
     });
 
     svr.Get("/benchmark", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         auto q = parseVec(req.get_param_value("v"));
         if ((int)q.size() != DIMS) {
             res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
@@ -1046,16 +1370,16 @@ int main(int argc, char** argv) {
         }
         int k = 5; try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
         auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
-        auto b = db.benchmark(q, k, metric);
+        auto b = sp.db.benchmark(q, k, metric);
         std::ostringstream ss;
         ss << "{\"bruteforceUs\":" << b.bfUs << ",\"kdtreeUs\":" << b.kdUs
            << ",\"hnswUs\":"       << b.hnswUs << ",\"itemCount\":" << b.n << '}';
         res.set_content(ss.str(), "application/json");
     });
 
-    svr.Get("/hnsw-info", [&](const httplib::Request&, httplib::Response& res) {
-        cors(res);
-        auto gi = db.hnswInfo();
+    svr.Get("/hnsw-info", [&](const httplib::Request& req, httplib::Response& res) {
+        auto& sp = space(req);
+        auto gi = sp.db.hnswInfo();
         std::ostringstream ss;
         ss << "{\"topLayer\":" << gi.topLayer << ",\"nodeCount\":" << gi.nodeCount
            << ",\"nodesPerLayer\":[";
@@ -1085,22 +1409,17 @@ int main(int argc, char** argv) {
 
     // ── DOCUMENT + RAG ENDPOINTS ──────────────────────────────────────
 
-    auto jsonErr = [](httplib::Response& res, int status, const std::string& msg) {
-        res.status = status;
-        res.set_content("{\"error\":" + jS(msg) + "}", "application/json");
-    };
-
     // POST /doc/insert  {"title":"...","text":"...","kind":"PDF"}
     // The browser extracts text from uploaded files (PDF, Word, Excel, …) and sends it here.
     // Chunks the text, embeds all chunks via Ollama, then stores the document atomically.
     svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         auto title = extractStr(req.body, "title");
         auto text  = extractStr(req.body, "text");
         auto kind  = extractStr(req.body, "kind");
         if (kind.empty()) kind = "TEXT";
         if (title.empty() || text.empty()) return jsonErr(res, 400, "need title and text");
-        if (docDB.hasTitle(title))
+        if (sp.docs.hasTitle(title))
             return jsonErr(res, 409, "A document named \"" + title + "\" is already stored. Delete it first.");
 
         auto chunks = chunkText(text, 250, 30);
@@ -1114,30 +1433,30 @@ int main(int argc, char** argv) {
         if (embs.empty()) return jsonErr(res, 503, err);
 
         size_t words = countWords(text);
-        int docId = docDB.insertDocument(title, kind, chunks, embs, words, err);
+        int docId = sp.docs.insertDocument(title, kind, chunks, embs, words, err);
         if (docId < 0) return jsonErr(res, 409, err);
 
         std::ostringstream ss;
         ss << "{\"docId\":"  << docId
            << ",\"chunks\":" << chunks.size()
            << ",\"words\":"  << words
-           << ",\"dims\":"   << docDB.getDims() << '}';
+           << ",\"dims\":"   << sp.docs.getDims() << '}';
         res.set_content(ss.str(), "application/json");
     });
 
     // DELETE /doc/delete/<docId>  — removes the whole document
     svr.Delete(R"(/doc/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         int id  = std::stoi(req.matches[1]);
-        bool ok = docDB.removeDocument(id);
+        bool ok = sp.docs.removeDocument(id);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
 
     // GET /doc/list  — one entry per document
-    svr.Get("/doc/list", [&](const httplib::Request&, httplib::Response& res) {
-        cors(res);
-        auto docs = docDB.list();
+    svr.Get("/doc/list", [&](const httplib::Request& req, httplib::Response& res) {
+        auto& sp = space(req);
+        auto docs = sp.docs.list();
         std::ostringstream ss; ss << '[';
         for (size_t i = 0; i < docs.size(); i++) {
             if (i) ss << ',';
@@ -1156,7 +1475,7 @@ int main(int argc, char** argv) {
     // POST /doc/search {"question":"...","k":3}
     // Fast retrieval for the UI visualizer
     svr.Post("/doc/search", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         auto question = extractStr(req.body, "question");
         int  k        = std::clamp(extractInt(req.body, "k", 3), 1, 10);
         if (question.empty()) return jsonErr(res, 400, "need question");
@@ -1165,7 +1484,7 @@ int main(int argc, char** argv) {
         auto qEmb = ollama.embed(question, err);
         if (qEmb.empty()) return jsonErr(res, 503, err);
 
-        auto hits = docDB.search(qEmb, k);
+        auto hits = sp.docs.search(qEmb, k);
 
         std::ostringstream ss;
         ss << "{\"contexts\":[";
@@ -1183,7 +1502,7 @@ int main(int argc, char** argv) {
     // POST /doc/ask  {"question":"...","k":3}
     // Full RAG pipeline: embed → retrieve → generate
     svr.Post("/doc/ask", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
+        auto& sp = space(req);
         auto question = extractStr(req.body, "question");
         int  k        = std::clamp(extractInt(req.body, "k", 3), 1, 10);
         if (question.empty()) return jsonErr(res, 400, "need question");
@@ -1194,7 +1513,7 @@ int main(int argc, char** argv) {
         if (qEmb.empty()) return jsonErr(res, 503, err);
 
         // Step 2: retrieve top-k relevant chunks
-        auto hits = docDB.search(qEmb, k);
+        auto hits = sp.docs.search(qEmb, k);
 
         // Step 3: build prompt
         std::ostringstream ctx;
@@ -1229,30 +1548,30 @@ int main(int argc, char** argv) {
                << ",\"text\":"     << jS(hits[i].second.text)
                << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
         }
-        ss << "],\"docCount\":" << docDB.docCount() << '}';
+        ss << "],\"docCount\":" << sp.docs.docCount() << '}';
         res.set_content(ss.str(), "application/json");
     });
 
     // GET /status
-    svr.Get("/status", [&](const httplib::Request&, httplib::Response& res) {
-        cors(res);
+    svr.Get("/status", [&](const httplib::Request& req, httplib::Response& res) {
+        auto& sp = space(req);
         bool up = ollama.isAvailable();
         std::ostringstream ss;
         ss << "{\"ollamaAvailable\":"  << (up ? "true" : "false")
            << ",\"embedModel\":"       << jS(ollama.embedModel)
            << ",\"genModel\":"         << jS(ollama.genModel)
-           << ",\"docCount\":"         << docDB.docCount()
-           << ",\"chunkCount\":"       << docDB.chunkCount()
-           << ",\"docDims\":"          << docDB.getDims()
+           << ",\"docCount\":"         << sp.docs.docCount()
+           << ",\"chunkCount\":"       << sp.docs.chunkCount()
+           << ",\"docDims\":"          << sp.docs.getDims()
            << ",\"demoDims\":"         << DIMS
-           << ",\"demoCount\":"        << db.size() << '}';
+           << ",\"demoCount\":"        << sp.db.size() << '}';
         res.set_content(ss.str(), "application/json");
     });
 
-    svr.Get("/stats", [&](const httplib::Request&, httplib::Response& res) {
-        cors(res);
+    svr.Get("/stats", [&](const httplib::Request& req, httplib::Response& res) {
+        auto& sp = space(req);
         std::ostringstream ss;
-        ss << "{\"count\":"      << db.size()
+        ss << "{\"count\":"      << sp.db.size()
            << ",\"dims\":"       << DIMS
            << ",\"algorithms\":[\"bruteforce\",\"kdtree\",\"hnsw\"]"
            << ",\"metrics\":[\"euclidean\",\"cosine\",\"manhattan\"]}";
@@ -1269,12 +1588,16 @@ int main(int argc, char** argv) {
         };
     };
     svr.Get("/",           serveFile("index.html", "text/html; charset=utf-8"));
+    svr.Get("/login", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!sessions.user(req).empty()) return res.set_redirect("/");
+        serveFile("login.html", "text/html; charset=utf-8")(req, res);
+    });
     svr.Get("/extract.js", serveFile("extract.js", "text/javascript; charset=utf-8"));
     // Third-party document parsers (pdf.js, mammoth, SheetJS, JSZip)
     if (!svr.set_mount_point("/vendor", "./vendor"))
         std::cout << "WARNING: ./vendor not found — run from the project folder or file uploads won't work" << std::endl;
 
-    if (!svr.listen("0.0.0.0", port)) {
+    if (!svr.listen(lan ? "0.0.0.0" : "127.0.0.1", port)) {
         std::cerr << "ERROR: could not listen on port " << port
                   << " (already in use? try: ./db " << port + 1 << ")" << std::endl;
         return 1;
