@@ -249,6 +249,34 @@ The file type is detected from the file's **content**, not just its name, so a r
 
 The AI uses your documents when they contain relevant information, and otherwise answers from its general knowledge. Answers take a few seconds up to ~30 s on a laptop CPU.
 
+#### What happens when you click ASK AI
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant App as Browser<br/>(index.html)
+    participant Server as Aura AI server<br/>(main.cpp)
+    participant DB as Your documents<br/>(DocumentDB)
+    participant Ollama as Ollama<br/>(local AI)
+
+    You->>App: Type a question, click 🤖 ASK AI
+    App->>Server: POST /doc/ask {question, k: 3}<br/>+ session cookie
+    Server->>Server: Check the cookie: are you signed in?
+    Server->>Ollama: Embed the question (nomic-embed-text)
+    Ollama-->>Server: 768 numbers that capture its meaning
+    Server->>DB: Find the k chunks closest in meaning
+    DB-->>Server: Best chunks + their distances<br/>(only close matches, distance ≤ 0.7)
+    Server->>Server: Build the prompt:<br/>instructions + chunks + your question
+    Server->>Ollama: Generate an answer (llama3.2)
+    Note over Ollama: The slow step: a few seconds<br/>up to ~30 s on a laptop CPU
+    Ollama-->>Server: The answer text
+    Server-->>App: {answer, model, contexts[]}
+    App-->>You: Answer (typed out) + source chips<br/>+ ★ on the map near the sources
+```
+
+Every step runs on your computer. Only you can see your documents: the server searches the signed-in user's documents and nobody else's.
+
 ### 4. Search tab & the semantic map: see how vector search works
 
 This part is a small, visual **demo** of vector search, using 20 built-in example items in 4 categories (CS, Math, Food, Sports). Each item has 16 dimensions, 4 per category.
