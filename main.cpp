@@ -15,6 +15,10 @@
 #include <functional>
 #include <fstream>
 #include <climits>
+#include <map>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
 
 static const int DIMS = 16;   // demo vectors
 // Doc embeddings dimension is determined at runtime from Ollama's model output
@@ -440,6 +444,9 @@ std::string jS(const std::string& s) {
         else if (c == '\n') o += "\\n";
         else if (c == '\r') o += "\\r";
         else if (c == '\t') o += "\\t";
+        else if ((unsigned char)c < 0x20) {   // other control chars are invalid raw in JSON
+            char buf[8]; std::snprintf(buf, sizeof buf, "\\u%04x", (unsigned char)c); o += buf;
+        }
         else                o += c;
     }
     return o + '"';
@@ -462,42 +469,120 @@ std::vector<float> parseVec(const std::string& s) {
     return v;
 }
 
-// Extract a JSON string field value (handles basic escape sequences)
-std::string extractStr(const std::string& body, const std::string& key) {
-    size_t p = body.find('"' + key + '"');
-    if (p == std::string::npos) return "";
-    p = body.find(':', p) + 1;
-    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
-    if (p >= body.size() || body[p] != '"') return "";
-    p++;
-    std::string result;
-    while (p < body.size()) {
-        if (body[p] == '"') break;
-        if (body[p] == '\\' && p + 1 < body.size()) {
-            p++;
-            switch (body[p]) {
-                case '"':  result += '"';  break;
-                case '\\': result += '\\'; break;
-                case 'n':  result += '\n'; break;
-                case 'r':  result += '\r'; break;
-                case 't':  result += '\t'; break;
-                default:   result += body[p]; break;
-            }
-        } else {
-            result += body[p];
-        }
-        p++;
+// Minimal JSON reading for flat request bodies like {"title":"...","text":"...","k":3}.
+// Keys are located by walking the top-level object, so a key name appearing
+// inside some string value (e.g. a document containing the word "text") can't be mistaken for it.
+
+static size_t jSkipStr(const std::string& b, size_t p) {       // p at opening quote
+    for (p++; p < b.size(); p++) {
+        if (b[p] == '\\') p++;
+        else if (b[p] == '"') return p + 1;
     }
-    return result;
+    return b.size();
+}
+
+static size_t jSkipVal(const std::string& b, size_t p) {
+    if (p >= b.size()) return p;
+    if (b[p] == '"') return jSkipStr(b, p);
+    if (b[p] == '{' || b[p] == '[') {
+        int depth = 0;
+        while (p < b.size()) {
+            char c = b[p];
+            if (c == '"') { p = jSkipStr(b, p); continue; }
+            if (c == '{' || c == '[') depth++;
+            else if ((c == '}' || c == ']') && --depth == 0) return p + 1;
+            p++;
+        }
+        return p;
+    }
+    while (p < b.size() && b[p] != ',' && b[p] != '}' && b[p] != ']') p++;
+    return p;
+}
+
+// Index of the value belonging to a top-level key, or npos
+static size_t jFindKey(const std::string& b, const std::string& key) {
+    size_t p = b.find('{');
+    if (p == std::string::npos) return p;
+    p++;
+    auto ws = [&]{ while (p < b.size() && std::isspace((unsigned char)b[p])) p++; };
+    while (true) {
+        ws();
+        if (p >= b.size() || b[p] != '"') return std::string::npos;
+        size_t ks = p;
+        p = jSkipStr(b, p);
+        bool match = b.compare(ks + 1, p - ks - 2, key) == 0 && p - ks - 2 == key.size();
+        ws();
+        if (p >= b.size() || b[p] != ':') return std::string::npos;
+        p++; ws();
+        if (match) return p;
+        p = jSkipVal(b, p); ws();
+        if (p < b.size() && b[p] == ',') { p++; continue; }
+        return std::string::npos;
+    }
+}
+
+static void appendUtf8(std::string& o, uint32_t cp) {
+    if (cp < 0x80)         o += (char)cp;
+    else if (cp < 0x800)   { o += (char)(0xC0 | (cp >> 6));  o += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { o += (char)(0xE0 | (cp >> 12)); o += (char)(0x80 | ((cp >> 6) & 0x3F));
+                             o += (char)(0x80 | (cp & 0x3F)); }
+    else                   { o += (char)(0xF0 | (cp >> 18)); o += (char)(0x80 | ((cp >> 12) & 0x3F));
+                             o += (char)(0x80 | ((cp >> 6) & 0x3F)); o += (char)(0x80 | (cp & 0x3F)); }
+}
+
+static int hex4(const std::string& b, size_t p) {              // -1 if not 4 hex digits
+    if (p + 4 > b.size()) return -1;
+    int v = 0;
+    for (size_t i = p; i < p + 4; i++) {
+        char c = b[i]; v <<= 4;
+        if      (c >= '0' && c <= '9') v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+        else return -1;
+    }
+    return v;
+}
+
+// Extract a JSON string field value (full escape support, incl. \uXXXX and surrogate pairs)
+std::string extractStr(const std::string& body, const std::string& key) {
+    size_t p = jFindKey(body, key);
+    if (p == std::string::npos || p >= body.size() || body[p] != '"') return "";
+    std::string r;
+    for (p++; p < body.size() && body[p] != '"'; p++) {
+        if (body[p] != '\\' || p + 1 >= body.size()) { r += body[p]; continue; }
+        char e = body[++p];
+        switch (e) {
+            case 'n': r += '\n'; break;
+            case 'r': r += '\r'; break;
+            case 't': r += '\t'; break;
+            case 'b': r += '\b'; break;
+            case 'f': r += '\f'; break;
+            case 'u': {
+                int cp = hex4(body, p + 1);
+                if (cp < 0) { r += 'u'; break; }
+                p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {                  // high surrogate: needs a low one
+                    int lo = (p + 2 < body.size() && body[p+1] == '\\' && body[p+2] == 'u')
+                             ? hex4(body, p + 3) : -1;
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p += 6;
+                    } else cp = 0xFFFD;
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) cp = 0xFFFD; // lone low surrogate
+                appendUtf8(r, (uint32_t)cp);
+                break;
+            }
+            default: r += e; break;                                   // \" \\ \/
+        }
+    }
+    return r;
 }
 
 // Extract a JSON integer field value
 int extractInt(const std::string& body, const std::string& key, int def = 0) {
-    size_t p = body.find('"' + key + '"');
+    size_t p = jFindKey(body, key);
     if (p == std::string::npos) return def;
-    p = body.find(':', p) + 1;
-    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
-    try { return std::stoi(body.substr(p)); } catch (...) { return def; }
+    try { return std::stoi(body.substr(p, 24)); } catch (...) { return def; }
 }
 
 bool parseBody(const std::string& b, std::string& meta,
@@ -505,17 +590,30 @@ bool parseBody(const std::string& b, std::string& meta,
 {
     meta = extractStr(b, "metadata");
     cat  = extractStr(b, "category");
-    auto extractArr = [&](const std::string& key) -> std::vector<float> {
-        size_t p = b.find('"' + key + '"');
-        if (p == std::string::npos) return {};
-        p = b.find('[', p);
-        if (p == std::string::npos) return {};
+    emb.clear();
+    size_t p = jFindKey(b, "embedding");
+    if (p != std::string::npos && p < b.size() && b[p] == '[') {
         size_t e = b.find(']', p);
-        if (e == std::string::npos) return {};
-        return parseVec(b.substr(p + 1, e - p - 1));
-    };
-    emb = extractArr("embedding");
+        if (e != std::string::npos) emb = parseVec(b.substr(p + 1, e - p - 1));
+    }
     return !meta.empty() && !emb.empty();
+}
+
+// Cut to at most n bytes without splitting a UTF-8 character
+std::string utf8Prefix(const std::string& s, size_t n) {
+    if (s.size() <= n) return s;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    return s.substr(0, n);
+}
+
+size_t countWords(const std::string& s) {
+    size_t n = 0; bool in = false;
+    for (unsigned char c : s) {
+        bool sp = std::isspace(c);
+        if (!sp && !in) n++;
+        in = !sp;
+    }
+    return n;
 }
 
 void cors(httplib::Response& res) {
@@ -562,34 +660,28 @@ class OllamaClient {
     std::string host;
     int         port;
 
-    // Escape a string for embedding inside a JSON string literal
-    std::string esc(const std::string& s) {
-        std::string o;
-        for (char c : s) {
-            if      (c == '"')  o += "\\\"";
-            else if (c == '\\') o += "\\\\";
-            else if (c == '\n') o += "\\n";
-            else if (c == '\r') o += "\\r";
-            else if (c == '\t') o += "\\t";
-            else                o += c;
+    // Parse {"embeddings":[[...],[...]]} from Ollama /api/embed response
+    std::vector<std::vector<float>> parseEmbeddings(const std::string& body) {
+        std::vector<std::vector<float>> out;
+        size_t p = jFindKey(body, "embeddings");
+        if (p == std::string::npos || body[p] != '[') return out;
+        for (p++; p < body.size() && body[p] != ']'; p++) {
+            if (body[p] != '[') continue;
+            size_t e = body.find(']', p);
+            if (e == std::string::npos) break;
+            out.push_back(parseVec(body.substr(p + 1, e - p - 1)));
+            p = e;
         }
-        return o;
+        return out;
     }
 
-    // Parse {"embedding":[...]} from Ollama /api/embeddings response
-    std::vector<float> parseEmbedding(const std::string& body) {
-        size_t p = body.find("\"embedding\"");
-        if (p == std::string::npos) return {};
-        p = body.find('[', p);
-        if (p == std::string::npos) return {};
-        // Find matching ]  — embeddings can be large (768+ floats)
-        size_t e = p + 1, depth = 1;
-        while (e < body.size() && depth > 0) {
-            if (body[e] == '[') depth++;
-            else if (body[e] == ']') depth--;
-            e++;
-        }
-        return parseVec(body.substr(p + 1, e - p - 2));
+    // Human-readable reason for a failed Ollama call
+    std::string describe(const httplib::Result& res, const std::string& model) {
+        if (!res) return "Ollama is not running. Start it with: ollama serve";
+        auto e = extractStr(res->body, "error");
+        if (e.find("not found") != std::string::npos)
+            return "Ollama model '" + model + "' is missing. Run: ollama pull " + model;
+        return "Ollama error (HTTP " + std::to_string(res->status) + ")" + (e.empty() ? "" : ": " + e);
     }
 
     // Parse {"response":"..."} from Ollama /api/generate response
@@ -611,28 +703,47 @@ public:
         return res && res->status == 200;
     }
 
-    // Returns empty vector if Ollama is not running or model not found
-    std::vector<float> embed(const std::string& text) {
+    // Embeds many texts, sending them to Ollama in batches.
+    // Returns one vector per input, or an empty result with `err` set on failure.
+    std::vector<std::vector<float>> embedBatch(const std::vector<std::string>& texts,
+                                               std::string& err, size_t batch = 32)
+    {
+        std::vector<std::vector<float>> out;
         httplib::Client cli(host, port);
         cli.set_connection_timeout(3, 0);
-        cli.set_read_timeout(30, 0);
-        std::string body = "{\"model\":\"" + embedModel + "\",\"prompt\":\"" + esc(text) + "\"}";
-        auto res = cli.Post("/api/embeddings", body, "application/json");
-        if (!res || res->status != 200) return {};
-        return parseEmbedding(res->body);
+        cli.set_read_timeout(120, 0);
+        for (size_t i = 0; i < texts.size(); i += batch) {
+            std::string body = "{\"model\":" + jS(embedModel) + ",\"input\":[";
+            for (size_t j = i; j < std::min(i + batch, texts.size()); j++)
+                body += (j > i ? "," : "") + jS(texts[j]);
+            body += "]}";
+            auto res = cli.Post("/api/embed", body, "application/json");
+            if (!res || res->status != 200) { err = describe(res, embedModel); return {}; }
+            auto embs = parseEmbeddings(res->body);
+            if (embs.size() != std::min(batch, texts.size() - i)) {
+                err = "Ollama returned an unexpected embedding response"; return {};
+            }
+            for (auto& e : embs) out.push_back(std::move(e));
+        }
+        return out;
     }
 
-    // Returns error string if Ollama is unavailable
-    std::string generate(const std::string& prompt) {
+    // Returns empty vector if Ollama is not running or model not found
+    std::vector<float> embed(const std::string& text, std::string& err) {
+        auto r = embedBatch({text}, err);
+        return r.empty() ? std::vector<float>{} : r[0];
+    }
+
+    // Returns the model's answer, or an empty string with `err` set on failure
+    std::string generate(const std::string& prompt, std::string& err) {
         httplib::Client cli(host, port);
         cli.set_connection_timeout(3, 0);
         cli.set_read_timeout(180, 0);   // LLMs can be slow
-        std::string body = "{\"model\":\"" + genModel + "\","
-                           "\"prompt\":\"" + esc(prompt) + "\","
+        std::string body = "{\"model\":" + jS(genModel) + ","
+                           "\"prompt\":" + jS(prompt) + ","
                            "\"stream\":false}";
         auto res = cli.Post("/api/generate", body, "application/json");
-        if (!res || res->status != 200)
-            return "ERROR: Ollama unavailable. Run: ollama serve";
+        if (!res || res->status != 200) { err = describe(res, genModel); return ""; }
         return parseResponse(res->body);
     }
 };
@@ -641,36 +752,96 @@ public:
 //  DOCUMENT DATABASE  — HNSW over real Ollama embeddings
 // =====================================================================
 
-struct DocItem {
-    int         id;
-    std::string title;
+static const int MAX_DOC_CHUNKS = 2000;   // ~440k words per document
+// Below this many chunks document search is an exact brute-force scan (a few ms).
+// HNSW's simple "keep the closest M" neighbor pruning can leave outlier chunks
+// (often the ones holding a specific fact) unreachable, which hurts RAG recall.
+static const size_t EXACT_SEARCH_MAX = 20000;
+
+struct DocItem {                 // one chunk of a document
+    int         id;              // chunk id (node id in the indexes)
+    int         docId;           // document it belongs to
+    std::string title;           // e.g. "notes.pdf [2/9]"
     std::string text;
     std::vector<float> emb;
 };
 
+struct DocInfo {                 // one uploaded / pasted document
+    int         docId;
+    std::string title, kind, preview;
+    int         chunks;
+    size_t      words;
+};
+
 class DocumentDB {
     std::unordered_map<int, DocItem> store;
+    std::map<int, DocInfo> docs;
     HNSW       hnsw;
-    BruteForce bf;       // brute force fallback for small sets
+    BruteForce bf;       // exact search up to EXACT_SEARCH_MAX chunks
     std::mutex mu;
-    int nextId = 1;
-    int dims   = 0;      // determined from first inserted embedding
+    int nextId    = 1;
+    int nextDocId = 1;
+    int dims      = 0;   // determined from first inserted embedding
+
+    // HNSW::remove leaves holes in the graph, so after deleting a document
+    // the indexes are rebuilt from the remaining chunks (in id order)
+    void rebuildIndexes() {
+        hnsw = HNSW(16, 200);
+        bf   = BruteForce();
+        std::vector<int> ids;
+        for (auto& [id, it] : store) ids.push_back(id);
+        std::sort(ids.begin(), ids.end());
+        for (int id : ids) {
+            auto& it = store[id];
+            VectorItem vi{id, it.title, "doc", it.emb};
+            hnsw.insert(vi, cosine); bf.insert(vi);
+        }
+    }
+
+    bool hasTitleLocked(const std::string& title) {
+        for (auto& [id, d] : docs) if (d.title == title) return true;
+        return false;
+    }
 
 public:
     DocumentDB() : hnsw(16, 200) {}
 
-    // Insert one chunk with its pre-computed embedding
-    int insert(const std::string& title, const std::string& text,
-               const std::vector<float>& emb)
+    bool hasTitle(const std::string& title) {
+        std::lock_guard<std::mutex> lk(mu);
+        return hasTitleLocked(title);
+    }
+
+    // Stores all chunks of a document at once. Returns docId, or -1 with `err` set.
+    int insertDocument(const std::string& title, const std::string& kind,
+                       const std::vector<std::string>& chunks,
+                       const std::vector<std::vector<float>>& embs, size_t words, std::string& err)
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (dims == 0) dims = (int)emb.size();
-        DocItem item{nextId++, title, text, emb};
-        store[item.id] = item;
-        VectorItem vi{item.id, title, "doc", emb};
-        hnsw.insert(vi, cosine);
-        bf.insert(vi);
-        return item.id;
+        if (hasTitleLocked(title)) { err = "A document named \"" + title + "\" is already stored. Delete it first."; return -1; }
+        int d = dims ? dims : (int)embs[0].size();
+        for (auto& e : embs)
+            if ((int)e.size() != d) {
+                err = "Embedding size mismatch (" + std::to_string(e.size()) + " vs " + std::to_string(d) +
+                      "). Did the embed model change? Restart the server.";
+                return -1;
+            }
+        dims = d;
+
+        int docId = nextDocId++;
+        for (size_t i = 0; i < chunks.size(); i++) {
+            std::string chunkTitle = chunks.size() > 1
+                ? title + " [" + std::to_string(i+1) + "/" + std::to_string(chunks.size()) + "]"
+                : title;
+            DocItem item{nextId++, docId, chunkTitle, chunks[i], embs[i]};
+            VectorItem vi{item.id, chunkTitle, "doc", item.emb};
+            hnsw.insert(vi, cosine); bf.insert(vi);
+            store[item.id] = std::move(item);
+        }
+        std::string preview = utf8Prefix(chunks[0], 160);
+        std::replace(preview.begin(), preview.end(), '\n', ' ');
+        if (preview.size() < chunks[0].size()) preview += "…";
+        docs[docId] = {docId, title, kind, preview, (int)chunks.size(), words};
+        return docId;
     }
 
     // Semantic search — returns top-k most similar chunks
@@ -678,8 +849,8 @@ public:
         const std::vector<float>& q, int k, float max_dist = 0.7f)
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (store.empty()) return {};
-        auto raw = (store.size() < 10)
+        if (store.empty() || (int)q.size() != dims) return {};
+        auto raw = (store.size() <= EXACT_SEARCH_MAX)
                    ? bf.knn(q, k, cosine)
                    : hnsw.knn(q, k, 50, cosine);
         std::vector<std::pair<float, DocItem>> out;
@@ -688,26 +859,39 @@ public:
         return out;
     }
 
-    bool remove(int id) {
+    // Removes a whole document (all of its chunks)
+    bool removeDocument(int docId) {
         std::lock_guard<std::mutex> lk(mu);
-        if (!store.count(id)) return false;
-        store.erase(id); hnsw.remove(id); bf.remove(id);
+        if (!docs.count(docId)) return false;
+        for (auto it = store.begin(); it != store.end(); )
+            it = (it->second.docId == docId) ? store.erase(it) : std::next(it);
+        docs.erase(docId);
+        rebuildIndexes();
+        if (store.empty()) dims = 0;
         return true;
     }
 
-    std::vector<DocItem> all() {
+    std::vector<DocInfo> list() {
         std::lock_guard<std::mutex> lk(mu);
-        std::vector<DocItem> r;
-        for (auto& [id, v] : store) r.push_back(v);
+        std::vector<DocInfo> r;
+        for (auto& [id, d] : docs) r.push_back(d);
         return r;
     }
 
-    size_t size() {
+    size_t chunkCount() {
         std::lock_guard<std::mutex> lk(mu);
         return store.size();
     }
 
-    int getDims() { return dims; }
+    size_t docCount() {
+        std::lock_guard<std::mutex> lk(mu);
+        return docs.size();
+    }
+
+    int getDims() {
+        std::lock_guard<std::mutex> lk(mu);
+        return dims;
+    }
 };
 
 // =====================================================================
@@ -763,7 +947,8 @@ void loadDemo(VectorDB& db) {
 //  HTTP SERVER
 // =====================================================================
 
-int main() {
+int main(int argc, char** argv) {
+    int port = argc > 1 ? std::atoi(argv[1]) : 8080;   // ./db [port]
     VectorDB   db(DIMS);
     DocumentDB docDB;
     OllamaClient ollama;
@@ -773,7 +958,7 @@ int main() {
     // Check Ollama at startup (non-fatal)
     bool ollamaUp = ollama.isAvailable();
     std::cout << "=== VectorDB Engine ===" << std::endl;
-    std::cout << "http://localhost:8080" << std::endl;
+    std::cout << "http://localhost:" << port << std::endl;
     std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
     std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
     if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
@@ -900,67 +1085,69 @@ int main() {
 
     // ── DOCUMENT + RAG ENDPOINTS ──────────────────────────────────────
 
-    // POST /doc/insert  {"title":"...","text":"..."}
-    // Chunks the text, embeds each chunk via Ollama, stores in DocumentDB
+    auto jsonErr = [](httplib::Response& res, int status, const std::string& msg) {
+        res.status = status;
+        res.set_content("{\"error\":" + jS(msg) + "}", "application/json");
+    };
+
+    // POST /doc/insert  {"title":"...","text":"...","kind":"PDF"}
+    // The browser extracts text from uploaded files (PDF, Word, Excel, …) and sends it here.
+    // Chunks the text, embeds all chunks via Ollama, then stores the document atomically.
     svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto title = extractStr(req.body, "title");
         auto text  = extractStr(req.body, "text");
-        if (title.empty() || text.empty()) {
-            res.set_content("{\"error\":\"need title and text\"}", "application/json"); return;
-        }
+        auto kind  = extractStr(req.body, "kind");
+        if (kind.empty()) kind = "TEXT";
+        if (title.empty() || text.empty()) return jsonErr(res, 400, "need title and text");
+        if (docDB.hasTitle(title))
+            return jsonErr(res, 409, "A document named \"" + title + "\" is already stored. Delete it first.");
 
         auto chunks = chunkText(text, 250, 30);
-        std::vector<int> ids;
+        if (chunks.empty()) return jsonErr(res, 400, "The document contains no words");
+        if ((int)chunks.size() > MAX_DOC_CHUNKS)
+            return jsonErr(res, 413, "Document too large: " + std::to_string(chunks.size()) +
+                           " chunks (max " + std::to_string(MAX_DOC_CHUNKS) + "). Split it into smaller files.");
 
-        for (int i = 0; i < (int)chunks.size(); i++) {
-            auto emb = ollama.embed(chunks[i]);
-            if (emb.empty()) {
-                res.set_content(
-                    "{\"error\":\"Ollama unavailable. "
-                    "Install from https://ollama.com then run: "
-                    "ollama pull nomic-embed-text && ollama pull llama3.2\"}",
-                    "application/json");
-                return;
-            }
-            std::string chunkTitle = (chunks.size() > 1)
-                ? title + " [" + std::to_string(i+1) + "/" + std::to_string(chunks.size()) + "]"
-                : title;
-            ids.push_back(docDB.insert(chunkTitle, chunks[i], emb));
-        }
+        std::string err;
+        auto embs = ollama.embedBatch(chunks, err);
+        if (embs.empty()) return jsonErr(res, 503, err);
+
+        size_t words = countWords(text);
+        int docId = docDB.insertDocument(title, kind, chunks, embs, words, err);
+        if (docId < 0) return jsonErr(res, 409, err);
 
         std::ostringstream ss;
-        ss << "{\"ids\":[";
-        for (size_t i = 0; i < ids.size(); i++) { if (i) ss << ','; ss << ids[i]; }
-        ss << "],\"chunks\":" << chunks.size()
-           << ",\"dims\":"    << docDB.getDims() << '}';
+        ss << "{\"docId\":"  << docId
+           << ",\"chunks\":" << chunks.size()
+           << ",\"words\":"  << words
+           << ",\"dims\":"   << docDB.getDims() << '}';
         res.set_content(ss.str(), "application/json");
     });
 
-    // DELETE /doc/delete/123
+    // DELETE /doc/delete/<docId>  — removes the whole document
     svr.Delete(R"(/doc/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         int id  = std::stoi(req.matches[1]);
-        bool ok = docDB.remove(id);
+        bool ok = docDB.removeDocument(id);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
 
-    // GET /doc/list
+    // GET /doc/list  — one entry per document
     svr.Get("/doc/list", [&](const httplib::Request&, httplib::Response& res) {
         cors(res);
-        auto docs = docDB.all();
+        auto docs = docDB.list();
         std::ostringstream ss; ss << '[';
         for (size_t i = 0; i < docs.size(); i++) {
             if (i) ss << ',';
-            // Truncate text preview to 120 chars
-            std::string preview = docs[i].text.substr(0, 120);
-            if (docs[i].text.size() > 120) preview += "…";
-            ss << "{\"id\":" << docs[i].id
-               << ",\"title\":" << jS(docs[i].title)
-               << ",\"preview\":" << jS(preview)
-               << ",\"words\":"  << (int)std::count(docs[i].text.begin(), docs[i].text.end(), ' ') + 1
-               << '}';
+            auto& d = docs[i];
+            ss << "{\"docId\":"   << d.docId
+               << ",\"title\":"   << jS(d.title)
+               << ",\"kind\":"    << jS(d.kind)
+               << ",\"chunks\":"  << d.chunks
+               << ",\"words\":"   << d.words
+               << ",\"preview\":" << jS(d.preview) << '}';
         }
         ss << ']';
         res.set_content(ss.str(), "application/json");
@@ -971,15 +1158,12 @@ int main() {
     svr.Post("/doc/search", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto question = extractStr(req.body, "question");
-        int  k        = extractInt(req.body, "k", 3);
-        if (question.empty()) {
-            res.set_content("{\"error\":\"need question\"}", "application/json"); return;
-        }
+        int  k        = std::clamp(extractInt(req.body, "k", 3), 1, 10);
+        if (question.empty()) return jsonErr(res, 400, "need question");
 
-        auto qEmb = ollama.embed(question);
-        if (qEmb.empty()) {
-            res.set_content("{\"error\":\"Ollama unavailable\"}", "application/json"); return;
-        }
+        std::string err;
+        auto qEmb = ollama.embed(question, err);
+        if (qEmb.empty()) return jsonErr(res, 503, err);
 
         auto hits = docDB.search(qEmb, k);
 
@@ -988,6 +1172,7 @@ int main() {
         for (size_t i = 0; i < hits.size(); i++) {
             if (i) ss << ',';
             ss << "{\"id\":"       << hits[i].second.id
+               << ",\"docId\":"    << hits[i].second.docId
                << ",\"title\":"    << jS(hits[i].second.title)
                << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
         }
@@ -1000,16 +1185,13 @@ int main() {
     svr.Post("/doc/ask", [&](const httplib::Request& req, httplib::Response& res) {
         cors(res);
         auto question = extractStr(req.body, "question");
-        int  k        = extractInt(req.body, "k", 3);
-        if (question.empty()) {
-            res.set_content("{\"error\":\"need question\"}", "application/json"); return;
-        }
+        int  k        = std::clamp(extractInt(req.body, "k", 3), 1, 10);
+        if (question.empty()) return jsonErr(res, 400, "need question");
 
         // Step 1: embed the question
-        auto qEmb = ollama.embed(question);
-        if (qEmb.empty()) {
-            res.set_content("{\"error\":\"Ollama unavailable\"}", "application/json"); return;
-        }
+        std::string err;
+        auto qEmb = ollama.embed(question, err);
+        if (qEmb.empty()) return jsonErr(res, 503, err);
 
         // Step 2: retrieve top-k relevant chunks
         auto hits = docDB.search(qEmb, k);
@@ -1031,7 +1213,8 @@ int main() {
             "Answer:";
 
         // Step 4: generate answer
-        auto answer = ollama.generate(prompt);
+        auto answer = ollama.generate(prompt, err);
+        if (!err.empty()) return jsonErr(res, 503, err);
 
         // Step 5: return everything
         std::ostringstream ss;
@@ -1041,11 +1224,12 @@ int main() {
         for (size_t i = 0; i < hits.size(); i++) {
             if (i) ss << ',';
             ss << "{\"id\":"       << hits[i].second.id
+               << ",\"docId\":"    << hits[i].second.docId
                << ",\"title\":"    << jS(hits[i].second.title)
                << ",\"text\":"     << jS(hits[i].second.text)
                << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
         }
-        ss << "],\"docCount\":" << docDB.size() << '}';
+        ss << "],\"docCount\":" << docDB.docCount() << '}';
         res.set_content(ss.str(), "application/json");
     });
 
@@ -1057,7 +1241,8 @@ int main() {
         ss << "{\"ollamaAvailable\":"  << (up ? "true" : "false")
            << ",\"embedModel\":"       << jS(ollama.embedModel)
            << ",\"genModel\":"         << jS(ollama.genModel)
-           << ",\"docCount\":"         << docDB.size()
+           << ",\"docCount\":"         << docDB.docCount()
+           << ",\"chunkCount\":"       << docDB.chunkCount()
            << ",\"docDims\":"          << docDB.getDims()
            << ",\"demoDims\":"         << DIMS
            << ",\"demoCount\":"        << db.size() << '}';
@@ -1074,16 +1259,25 @@ int main() {
         res.set_content(ss.str(), "application/json");
     });
 
-    // Serve index.html
-    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        std::ifstream f("index.html");
-        if (!f.is_open()) { res.status = 404; return; }
-        res.set_content(
-            std::string(std::istreambuf_iterator<char>(f),
-                        std::istreambuf_iterator<char>()),
-            "text/html");
-    });
+    // ── STATIC FILES (served from the current directory) ──────────────
+    auto serveFile = [](const std::string& path, const std::string& mime) {
+        return [path, mime](const httplib::Request&, httplib::Response& res) {
+            std::ifstream f(path, std::ios::binary);
+            if (!f.is_open()) { res.status = 404; return; }
+            res.set_content(std::string(std::istreambuf_iterator<char>(f),
+                                        std::istreambuf_iterator<char>()), mime);
+        };
+    };
+    svr.Get("/",           serveFile("index.html", "text/html; charset=utf-8"));
+    svr.Get("/extract.js", serveFile("extract.js", "text/javascript; charset=utf-8"));
+    // Third-party document parsers (pdf.js, mammoth, SheetJS, JSZip)
+    if (!svr.set_mount_point("/vendor", "./vendor"))
+        std::cout << "WARNING: ./vendor not found — run from the project folder or file uploads won't work" << std::endl;
 
-    svr.listen("0.0.0.0", 8080);
+    if (!svr.listen("0.0.0.0", port)) {
+        std::cerr << "ERROR: could not listen on port " << port
+                  << " (already in use? try: ./db " << port + 1 << ")" << std::endl;
+        return 1;
+    }
     return 0;
 }

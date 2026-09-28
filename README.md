@@ -15,7 +15,7 @@ Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-
 | **3 Distance Metrics** | Cosine similarity, Euclidean distance, Manhattan distance |
 | **16D Demo Vectors** | 20 pre-loaded semantic vectors across 4 categories (CS, Math, Food, Sports) |
 | **2D PCA Scatter Plot** | Live visualization of semantic space — watch clusters form |
-| **Real Document Embedding** | Paste any text → Ollama embeds it with `nomic-embed-text` (768D) |
+| **Upload Any Document** | PDF, Word, PowerPoint, Excel, CSV, OpenDocument, RTF, EPUB, HTML, TXT/Markdown, code — text is extracted in the browser and embedded with `nomic-embed-text` (768D) |
 | **RAG Pipeline** | Ask questions about your documents → HNSW retrieves context → local LLM answers |
 | **Full REST API** | CRUD endpoints: insert, delete, search, benchmark, hnsw-info |
 
@@ -149,6 +149,10 @@ g++ -std=c++17 -O2 main.cpp -o db -lws2_32
 
 This produces `db.exe`. It takes about 10–20 seconds.
 
+> **macOS / Linux:** `clang++ -std=c++17 -O2 main.cpp -o db` (Linux: `g++ -std=c++17 -O2 main.cpp -o db -pthread`).
+> Always start the server **from the project folder** — it serves `index.html`, `extract.js` and `vendor/` from there.
+> To use another port: `./db 8090`.
+
 > **Troubleshooting:**
 > - `g++: command not found` → MSYS2 not in PATH, redo Step 1 point 5
 > - `undefined reference to WSA...` → missing `-lws2_32` flag, add it
@@ -199,13 +203,29 @@ http://localhost:8080
 
 ### Tab 2: Documents (Real Embeddings)
 
-This uses Ollama to generate **real 768-dimensional embeddings** from any text.
+This uses Ollama to generate **real 768-dimensional embeddings** from your documents.
 
-1. Type a title (e.g., `Operating Systems Notes`)
-2. Paste any text — lecture notes, textbook paragraphs, Wikipedia articles
-3. Click **⚡ EMBED & INSERT**
-4. Long documents are automatically split into overlapping 250-word chunks
-5. Each chunk gets its own embedding and is stored in a separate HNSW index
+1. **Drag & drop files** onto the upload box (or click it to browse). You can add many at once.
+2. Each file is read **in your browser** — nothing leaves your machine — then chunked and embedded.
+3. Or open **✎ OR PASTE TEXT** to paste notes directly.
+4. Long documents are automatically split into overlapping 250-word chunks, each with its own embedding.
+5. The ✕ on a stored document deletes the whole document (all of its chunks).
+
+**Supported formats**
+
+| Type | Extensions |
+|---|---|
+| PDF | `.pdf` (with selectable text) |
+| Word | `.docx`, `.doc` (97–2003) |
+| PowerPoint | `.pptx`, `.ppt` (97–2003) — slide text and speaker notes |
+| Spreadsheets | `.xlsx`, `.xls`, `.xlsb`, `.ods`, `.csv`, `.tsv` — each row indexed as `Column: value` |
+| OpenDocument | `.odt`, `.odp`, `.ods` |
+| Other documents | `.rtf`, `.epub`, `.html`, `.xml` |
+| Plain text | `.txt`, `.md`, `.json`, `.log`, source code, … (any text file) |
+
+Not supported yet: scanned PDFs and images (need OCR), password-protected files, Apple Pages/Keynote
+(export to PDF/Word first), audio/video, and archives (`.zip` — unzip first). These are rejected with a clear message.
+File type is detected from the content, so a mis-named file (e.g. a `.docx` saved as `.doc`) still works.
 
 ### Tab 3: Ask AI (RAG Pipeline)
 
@@ -245,9 +265,10 @@ The server exposes a full REST API at `http://localhost:8080`.
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
-| `POST` | `/doc/insert` | `{"title":"...","text":"..."}` | Embed and store document |
-| `GET` | `/doc/list` | — | List all stored documents |
-| `DELETE` | `/doc/delete/:id` | — | Delete document chunk |
+| `POST` | `/doc/insert` | `{"title":"...","text":"...","kind":"PDF"}` | Chunk, embed and store a document (all-or-nothing) |
+| `GET` | `/doc/list` | — | List stored documents (one entry per document) |
+| `DELETE` | `/doc/delete/:docId` | — | Delete a whole document |
+| `POST` | `/doc/search` | `{"question":"...","k":3}` | Retrieval only (no LLM) |
 | `POST` | `/doc/ask` | `{"question":"...","k":3}` | RAG: retrieve + generate |
 | `GET` | `/status` | — | Ollama status and model info |
 
@@ -270,10 +291,12 @@ curl -X POST http://localhost:8080/doc/ask `
 ## Project Structure
 
 ```
-VectorDB/
+Your-OWN-AI/
 ├── main.cpp        ← C++ backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
 ├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
-├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark)
+├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark, uploads)
+├── extract.js      ← Browser-side text extraction for uploaded documents
+├── vendor/         ← Document parsers: pdf.js, mammoth, SheetJS, JSZip
 └── README.md       ← This file
 ```
 

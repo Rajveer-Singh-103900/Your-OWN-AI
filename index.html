@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>VectorDB — HNSW + RAG</title>
+<title>Aura AI</title>
+<link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -126,6 +127,25 @@ button {
 .dcard-preview { font-size: 10px; color: var(--muted); line-height: 1.5; margin-bottom: 6px; }
 .dcard-foot { display: flex; justify-content: space-between; align-items: center; }
 .dcard-words { font-size: 9px; color: var(--muted); }
+.kind { font-size: 8px; padding: 1px 6px; border-radius: 6px; margin-left: 6px; letter-spacing: .5px; vertical-align: middle;
+  color: var(--accent); border: 1px solid rgba(108,99,255,.35); background: rgba(108,99,255,.1); }
+
+/* ── FILE UPLOAD ── */
+.drop { border: 1.5px dashed var(--border); border-radius: 8px; padding: 18px 12px; text-align: center; cursor: pointer;
+  background: var(--bg); transition: border-color .2s, background .2s; }
+.drop:hover, .drop.over { border-color: var(--green); background: rgba(166,227,161,.06); }
+.drop-title { font-size: 12px; color: var(--green); margin-bottom: 4px; }
+.drop-sub { font-size: 9px; color: var(--muted); line-height: 1.6; }
+.uploads { display: flex; flex-direction: column; gap: 5px; }
+.urow { display: flex; align-items: center; gap: 8px; font-size: 10px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; animation: fadeUp .25s ease; }
+.urow .uname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.urow .ustat { flex-shrink: 0; max-width: 60%; text-align: right; color: var(--muted); }
+.urow.done  { border-color: rgba(166,227,161,.3); } .urow.done .ustat  { color: var(--green); }
+.urow.error { border-color: rgba(243,139,168,.3); } .urow.error .ustat { color: var(--red); white-space: normal; }
+.urow .spinner { width: 10px; height: 10px; border-width: 1.5px; }
+details.paste summary { font-size: 10px; color: var(--muted); cursor: pointer; letter-spacing: 1px; margin-bottom: 8px; }
+details.paste[open] summary { color: var(--text); }
 
 /* ── OLLAMA STATUS ── */
 .ollama-status { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; font-size: 11px; line-height: 1.6; }
@@ -160,7 +180,7 @@ button {
 <body>
 
 <header>
-  <h1>padhowithPratyush</h1>
+  <h1>Aura AI</h1>
   <span class="badge hl">HNSW</span>
   <span class="badge">KD-TREE</span>
   <span class="badge">BRUTE FORCE</span>
@@ -276,14 +296,26 @@ button {
         <div class="ollama-status" id="ollamaStatus">Checking…</div>
       </div>
       <div>
-        <div class="sec">Insert Document</div>
+        <div class="sec">Upload Documents</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="drop" id="dropZone" onclick="document.getElementById('fileInput').click()">
+            <div class="drop-title">⬆ Drop files here or click to browse</div>
+            <div class="drop-sub">PDF · Word (.docx .doc) · PowerPoint (.pptx .ppt) · Excel (.xlsx .xls) · CSV<br>
+              OpenDocument · RTF · EPUB · HTML · TXT · Markdown · JSON · code</div>
+          </div>
+          <input type="file" id="fileInput" multiple hidden>
+          <div class="uploads" id="uploads"></div>
+        </div>
+      </div>
+      <details class="paste">
+        <summary>✎ OR PASTE TEXT</summary>
         <div style="display:flex;flex-direction:column;gap:8px">
           <input type="text" id="docTitle" placeholder="Document title / topic…" />
           <textarea id="docText" placeholder="Paste your notes, textbook excerpt, lecture content…&#10;&#10;Long text is automatically split into overlapping chunks and each chunk gets its own real embedding via Ollama's nomic-embed-text model."></textarea>
           <button class="btn-g" id="insertDocBtn" onclick="insertDocument()">⚡ EMBED &amp; INSERT</button>
           <div id="insertStatus" style="font-size:11px;color:var(--muted)"></div>
         </div>
-      </div>
+      </details>
       <div>
         <div class="sec">Stored Documents (<span id="docCountLabel">0</span>)</div>
         <div class="doc-list" id="docList">
@@ -322,15 +354,24 @@ button {
 
 <div id="tip"></div>
 
+<!-- Document parsers (served locally from ./vendor so uploads work offline) -->
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/mammoth.browser.min.js"></script>
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="extract.js"></script>
 <script>
 // ════════════════════════════════════════════════════════════
 //  CONSTANTS
 // ════════════════════════════════════════════════════════════
-const API  = 'http://localhost:8080';
+const API  = location.protocol.startsWith('http') ? '' : 'http://localhost:8080';   // same origin when served by ./db
 const DIMS = 16;
 const COL  = { cs:'#00d9ff', math:'#b388ff', food:'#ffb74d', sports:'#69f0ae', doc:'#a6e3a1', default:'#90a4ae' };
 const DIM_COL = ['#00d9ff','#00d9ff','#00d9ff','#00d9ff','#b388ff','#b388ff','#b388ff','#b388ff',
                  '#ffb74d','#ffb74d','#ffb74d','#ffb74d','#69f0ae','#69f0ae','#69f0ae','#69f0ae'];
+
+// Escape text before putting it into innerHTML (document text is untrusted)
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ════════════════════════════════════════════════════════════
 //  STATE
@@ -496,7 +537,7 @@ sc.addEventListener('mousemove', e => {
   if (hoverItem) {
     const col=COL[hoverItem.category]||COL.default;
     tip.style.display='block';tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-8)+'px';
-    tip.innerHTML=`<span style="color:${col}">[${hoverItem.category}]</span><br>${hoverItem.metadata}`;
+    tip.innerHTML=`<span style="color:${col}">[${esc(hoverItem.category)}]</span><br>${esc(hoverItem.metadata)}`;
   } else tip.style.display='none';
 });
 sc.addEventListener('mouseleave',()=>{hoverItem=null;document.getElementById('tip').style.display='none';});
@@ -559,9 +600,9 @@ function renderResults(results) {
     const col=COL[r.category]||COL.default;
     return `<div class="rcard" onmouseenter="hoverItem={id:${r.id}}" onmouseleave="hoverItem=null">
       <div class="rrank">#${i+1} NEAREST</div>
-      <div class="rmeta">${r.metadata}</div>
+      <div class="rmeta">${esc(r.metadata)}</div>
       <div class="rfoot">
-        <span class="rcat" style="background:${col}18;color:${col};border:1px solid ${col}44">${r.category.toUpperCase()}</span>
+        <span class="rcat" style="background:${col}18;color:${col};border:1px solid ${col}44">${esc(r.category.toUpperCase())}</span>
         <span class="rdist">dist: ${r.distance.toFixed(5)}</span>
         <button class="del" onclick="deleteItem(${r.id})">✕</button>
       </div>
@@ -649,7 +690,7 @@ async function checkOllamaStatus() {
         `Embed: <span style="color:var(--accent)">${d.embedModel}</span><br>`+
         `Generate: <span style="color:var(--accent)">${d.genModel}</span><br>`+
         `Dims: <span style="color:var(--muted)">${d.docDims||'(first insert sets this)'}</span><br>`+
-        `Documents: <span style="color:var(--text)">${d.docCount}</span>`;
+        `Documents: <span style="color:var(--text)">${d.docCount}</span> <span style="color:var(--muted)">(${d.chunkCount} chunks)</span>`;
     } else {
       badge.className='badge err'; badge.textContent='OLLAMA ✗';
       box.className='ollama-status err';
@@ -662,6 +703,24 @@ async function checkOllamaStatus() {
   } catch(_) {}
 }
 
+// Sends extracted text to the server (chunk → embed → store). Throws on error.
+async function ingestText(title, text, kind) {
+  const r = await fetch(API+'/doc/insert', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title, text, kind})
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+
+  // Insert a 16D keyword vector into the visualizer DB so the document shows up on the map
+  const emb16 = textToEmbedding(title + ' ' + text.split(/\s+/).slice(0, 3000).join(' '));
+  fetch(API+'/insert', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({metadata: title, category: 'doc', embedding: emb16})
+  }).then(() => loadItems().then(loadHNSW));
+  return d;
+}
+
 async function insertDocument() {
   const title=document.getElementById('docTitle').value.trim();
   const text=document.getElementById('docText').value.trim();
@@ -671,38 +730,86 @@ async function insertDocument() {
 
   btn.disabled=true; btn.textContent='Embedding…';
   status.innerHTML='<span style="color:var(--muted)">Calling Ollama nomic-embed-text…</span>';
-
   try {
-    const r=await fetch(API+'/doc/insert',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({title,text})
-    });
-    const d=await r.json();
-    if (d.error) {
-      status.innerHTML=`<span style="color:var(--red)">✗ ${d.error}</span>`;
-    } else {
-      status.innerHTML=`<span style="color:var(--green)">✓ Inserted ${d.chunks} chunk(s) · ${d.dims}D embeddings</span>`;
-      document.getElementById('docTitle').value='';
-      document.getElementById('docText').value='';
-
-          // Insert a 16D fake vector into the visualizer DB so it shows up on the map
-          const emb16 = textToEmbedding(title + ' ' + text);
-          fetch(API+'/insert', {
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({metadata: title, category: 'doc', embedding: emb16})
-          }).then(() => { loadItems().then(loadHNSW); });
-
-      loadDocList(); checkOllamaStatus();
-    }
-  } catch(_) {
-    status.innerHTML='<span style="color:var(--red)">✗ Server error</span>';
+    const d = await ingestText(title, text, 'TEXT');
+    status.innerHTML=`<span style="color:var(--green)">✓ Inserted ${d.chunks} chunk(s) · ${d.dims}D embeddings</span>`;
+    document.getElementById('docTitle').value='';
+    document.getElementById('docText').value='';
+    loadDocList(); checkOllamaStatus();
+  } catch(e) {
+    status.innerHTML=`<span style="color:var(--red)">✗ ${esc(e.message || 'Server error')}</span>`;
   }
   btn.disabled=false; btn.textContent='⚡ EMBED & INSERT';
 }
 
+// ── FILE UPLOADS ─────────────────────────────────────────────
+// Files are read in the browser (extract.js) and ingested one at a time.
+const uploadQueue = [];
+let uploading = false;
+
+function addFiles(files) {
+  for (const file of files) {
+    const row = document.createElement('div');
+    row.className = 'urow';
+    row.innerHTML = `<span class="uname"></span><span class="ustat">Waiting…</span>`;
+    row.querySelector('.uname').textContent = file.name;
+    row.title = file.name;
+    document.getElementById('uploads').prepend(row);
+    uploadQueue.push({file, row});
+  }
+  if (!uploading) processUploads();
+}
+
+function setUpload(row, state, msg) {
+  row.className = 'urow ' + state;
+  const stat = row.querySelector('.ustat');
+  stat.textContent = msg;
+  if (state === 'busy') stat.insertAdjacentHTML('afterbegin', '<span class="spinner" style="display:inline-block;vertical-align:middle;margin-right:5px"></span>');
+}
+
+async function processUploads() {
+  uploading = true;
+  while (uploadQueue.length) {
+    const {file, row} = uploadQueue.shift();
+    let timer = null;
+    try {
+      if (!window.AuraExtract || !window.pdfjsLib)
+        throw new Error('The document reader did not load. Restart the server (Ctrl+C, then ./db from the project folder) and refresh the page.');
+      const {text, note} = await AuraExtract.extractText(file, msg => setUpload(row, 'busy', msg));
+      const words = text.split(/\s+/).filter(Boolean).length;
+      const est = Math.max(1, Math.ceil(words / 220)), t0 = Date.now();
+      const tick = () => setUpload(row, 'busy', `Embedding ~${est} chunk${est > 1 ? 's' : ''}… ${Math.round((Date.now() - t0) / 1000)}s`);
+      tick(); timer = setInterval(tick, 1000);
+      const ext = file.name.includes('.') ? file.name.split('.').pop().toUpperCase().slice(0, 6) : 'TEXT';
+      const d = await ingestText(file.name, text, ext);
+      setUpload(row, 'done', `✓ ${d.chunks} chunk${d.chunks > 1 ? 's' : ''} · ${d.words.toLocaleString()} words` + (note ? ` · ⚠ ${note}` : ''));
+      loadDocList(); checkOllamaStatus();
+    } catch (e) {
+      setUpload(row, 'error', '✗ ' + (e.message || 'Failed'));
+    } finally {
+      clearInterval(timer);
+    }
+  }
+  uploading = false;
+}
+
+(function initUploads() {
+  const zone = document.getElementById('dropZone'), input = document.getElementById('fileInput');
+  input.addEventListener('change', () => { addFiles([...input.files]); input.value = ''; });
+  ['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev => zone.addEventListener(ev, () => zone.classList.remove('over')));
+  zone.addEventListener('drop', e => { e.preventDefault(); addFiles([...e.dataTransfer.files]); });
+  // A file dropped anywhere else must not make the browser navigate away from the app
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files.length) { switchTab('docs'); addFiles([...e.dataTransfer.files]); } });
+})();
+
+let docCache = [];
+
 async function loadDocList() {
   try {
     const r=await fetch(API+'/doc/list'), docs=await r.json();
+    docCache = docs;
     document.getElementById('docCountLabel').textContent=docs.length;
     if (!docs.length) {
       document.getElementById('docList').innerHTML='<div style="color:var(--muted);font-size:11px">No documents yet.</div>';
@@ -710,19 +817,24 @@ async function loadDocList() {
     }
     document.getElementById('docList').innerHTML=docs.map(d=>`
       <div class="dcard">
-        <div class="dcard-title">${d.title}</div>
-        <div class="dcard-preview">${d.preview}</div>
+        <div class="dcard-title">${esc(d.title)}<span class="kind">${esc(d.kind)}</span></div>
+        <div class="dcard-preview">${esc(d.preview)}</div>
         <div class="dcard-foot">
-          <span class="dcard-words">${d.words} words</span>
-          <button class="del" onclick="deleteDoc(${d.id})">✕</button>
+          <span class="dcard-words">${d.words.toLocaleString()} words · ${d.chunks} chunk${d.chunks > 1 ? 's' : ''}</span>
+          <button class="del" onclick="deleteDoc(${d.docId})" title="Delete document">✕</button>
         </div>
       </div>`).join('');
   } catch(_) {}
 }
 
-async function deleteDoc(id) {
+async function deleteDoc(docId) {
   try {
-    await fetch(`${API}/doc/delete/${id}`,{method:'DELETE'});
+    const title = (docCache.find(d => d.docId === docId) || {}).title;
+    await fetch(`${API}/doc/delete/${docId}`,{method:'DELETE'});
+    // Also remove the document's point from the scatter-plot map
+    const pts = allItems.filter(v => v.category === 'doc' && v.metadata === title);
+    await Promise.all(pts.map(v => fetch(`${API}/delete/${v.id}`, {method:'DELETE'})));
+    if (pts.length) loadItems().then(loadHNSW);
     loadDocList(); checkOllamaStatus();
   } catch(_) {}
 }
@@ -804,15 +916,15 @@ async function askAI() {
     const aDiv=document.createElement('div'); aDiv.className='chat-a';
 
     if (d.error) {
-      aDiv.innerHTML=`<div class="chat-a-label">ERROR</div><div class="chat-a-text" style="color:var(--red)">${d.error}</div>`;
+      aDiv.innerHTML=`<div class="chat-a-label">ERROR</div><div class="chat-a-text" style="color:var(--red)">${esc(d.error)}</div>`;
     } else {
       // Build answer block with typewriter
-      aDiv.innerHTML=`<div class="chat-a-label">🤖 ${d.model||'llm'}</div>`+
+      aDiv.innerHTML=`<div class="chat-a-label">🤖 ${esc(d.model||'llm')}</div>`+
         `<div class="chat-a-text" id="typeTarget"></div>`+
         `<div class="chat-ctx">`+
           `<div class="chat-ctx-label">RETRIEVED CONTEXT (${d.contexts.length} chunks)</div>`+
-          d.contexts.map((c,i)=>`<span class="ctx-chip" onclick="toggleCtx(${i})">#${i+1} ${c.title} · ${c.distance.toFixed(3)}</span>`+
-            `<div class="ctx-expand" id="ctx-${i}">${c.text}</div>`).join('')+
+          d.contexts.map((c,i)=>`<span class="ctx-chip" onclick="toggleCtx(${i})">#${i+1} ${esc(c.title)} · ${c.distance.toFixed(3)}</span>`+
+            `<div class="ctx-expand" id="ctx-${i}" style="white-space:pre-wrap">${esc(c.text)}</div>`).join('')+
         `</div>`;
       history.appendChild(aDiv);
 

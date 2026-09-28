@@ -16,3 +16,6 @@ bin/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Server binary (macOS/Linux build output)
+/db
